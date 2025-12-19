@@ -77,7 +77,7 @@ modal run modal_video_scenes.py --video-url "https://example.com/video.mp4" --th
 
 ## API Endpoints
 
-### POST `/video/split`
+### POST `/start`
 
 Split a video into scene-based clips.
 
@@ -96,11 +96,12 @@ Split a video into scene-based clips.
 ```json
 {
   "workflow_name": "clip-video-split",
-  "job_id": "20250117_abc12345",
-  "call_id": "call-xxxxx",
+  "job_id": "call-xxxxx",
   "start_time": "2025-01-17T12:34:56.789123"
 }
 ```
+
+**Note:** The `job_id` returned is the Modal call_id, which should be used for status checking.
 
 **Parameters:**
 - `url` (string, required): Direct HTTP(S) URL to video file
@@ -109,9 +110,9 @@ Split a video into scene-based clips.
 - `include_audio` (bool, optional): Include audio in clips (default: true)
 - `mode` (string, optional): `"fast"` or `"precision"` (default: `"fast"`)
 
-### GET `/status/{call_id}`
+### GET `/status/{job_id}`
 
-Check the status of a processing job using the `call_id` from the start response.
+Check the status of a processing job using the `job_id` from the start response.
 
 **Response (Success):**
 ```json
@@ -148,7 +149,7 @@ Check the status of a processing job using the `call_id` from the start response
 ```javascript
 // Start a scene splitting job
 async function splitVideo(videoUrl) {
-  const response = await fetch(`${MODAL_API_URL}/video/split`, {
+  const response = await fetch(`${MODAL_API_URL}/start`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -160,13 +161,13 @@ async function splitVideo(videoUrl) {
     })
   });
   
-  const { job_id, call_id } = await response.json();
+  const { job_id } = await response.json();
   
   // Poll for completion
   let status = "pending";
   while (status === "pending") {
     await new Promise(resolve => setTimeout(resolve, 3000));
-    const statusResponse = await fetch(`${MODAL_API_URL}/status/${call_id}`);
+    const statusResponse = await fetch(`${MODAL_API_URL}/status/${job_id}`);
     const data = await statusResponse.json();
     status = data.status;
     
@@ -211,7 +212,7 @@ print(f"Used threshold: {result['usedThreshold']}")
 
 ```bash
 # Start split job
-curl -X POST "${MODAL_API_URL}/video/split" \
+curl -X POST "${MODAL_API_URL}/start" \
   -H "Content-Type: application/json" \
   -d '{
     "url": "https://example.com/video.mp4",
@@ -221,8 +222,8 @@ curl -X POST "${MODAL_API_URL}/video/split" \
     "mode": "fast"
   }'
 
-# Check status (use call_id from response)
-curl "${MODAL_API_URL}/status/CALL_ID"
+# Check status (use job_id from response)
+curl "${MODAL_API_URL}/status/JOB_ID"
 
 # Download clip (use publicUrl from status result)
 curl "https://media.kybercorp.org/video-clips/JOB_ID/video-scene-000.mp4" -o clip.mp4

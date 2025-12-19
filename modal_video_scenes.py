@@ -16,6 +16,15 @@ from datetime import datetime
 
 import modal
 
+# Import environment variables (same pattern as modal-gen-media-thumbnails)
+from env_vars import (
+    R2_ACCESS_KEY_ID,
+    R2_SECRET_ACCESS_KEY,
+    R2_ENDPOINT_URL,
+    R2_BUCKET_NAME,
+    R2_PUBLIC_CDN_URL,
+)
+
 # Modal app
 app = modal.App("clip-video")
 
@@ -191,14 +200,8 @@ def _initialize_r2_connection():
     """
     import boto3
     from botocore.config import Config
-    from env_vars import (
-        R2_ACCESS_KEY_ID,
-        R2_SECRET_ACCESS_KEY,
-        R2_ENDPOINT_URL,
-        R2_BUCKET_NAME,
-    )
     
-    # Validate required environment variables
+    # Validate required environment variables (imported from env_vars at module level)
     if not R2_ACCESS_KEY_ID or not R2_SECRET_ACCESS_KEY:
         raise ValueError(
             "R2 credentials are not set. Ensure R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY "
@@ -225,8 +228,6 @@ def store_clip_to_r2(clip_path: Path, r2_key: str) -> Dict[str, Any]:
     Store clip to Cloudflare R2 and return metadata.
     Re-uses pattern from modal-gen-media-thumbnails.
     """
-    from env_vars import R2_PUBLIC_CDN_URL
-    
     s3_resource, bucket_name = _initialize_r2_connection()
     
     # Upload to R2 (same pattern as modal-gen-media-thumbnails)
@@ -234,7 +235,7 @@ def store_clip_to_r2(clip_path: Path, r2_key: str) -> Dict[str, Any]:
         str(clip_path), r2_key
     )
     
-    # Generate public URL
+    # Generate public URL (R2_PUBLIC_CDN_URL imported from env_vars at module level)
     public_url = f"{R2_PUBLIC_CDN_URL}/{r2_key}"
     
     return {
@@ -561,15 +562,21 @@ def fastapi_app():
         include_audio: bool = True
         mode: Literal["fast", "precision"] = "fast"
 
-    @web_app.post("/video/split")
+    @web_app.post("/start")
     async def start_split_job(data: SplitRequest):
-        """Start a video scene splitting job asynchronously."""
+        """
+        Start a video scene splitting job asynchronously.
+
+        POST to this endpoint with job parameters.
+        Returns: {"job_id": "call-xxxxx", "workflow_name": "clip-video-split", "start_time": "..."}
+        """
         model = VideoScenes()
-        job_id = generate_unique_id()
+        # Generate unique ID for file organization
+        file_job_id = generate_unique_id()
         
         call = model.split_video_on_scenes.spawn(
             video_url=data.url,
-            job_id=job_id,
+            job_id=file_job_id,  # Used for organizing files in R2
             threshold=data.threshold,
             min_scene_ms=data.min_scene_ms,
             include_audio=data.include_audio,
@@ -577,16 +584,20 @@ def fastapi_app():
         )
         return {
             "workflow_name": "clip-video-split",
-            "job_id": job_id,
-            "call_id": call.object_id,
+            "job_id": call.object_id,  # Match modal-gen-media-thumbnails: job_id in response is the call_id
             "start_time": datetime.now().isoformat(),
         }
 
-    @web_app.get("/status/{call_id}")
-    async def check_status(call_id: str):
-        """Check the status of a video processing job using the call_id from the start response."""
+    @web_app.get("/status/{job_id}")
+    async def check_status(job_id: str):
+        """
+        Check the status of a video processing job.
+
+        GET to this endpoint with job_id from /start response.
+        Returns: {"status": "done"|"pending"|"failed", "result": {...}|null}
+        """
         try:
-            function_call = FunctionCall.from_id(call_id)
+            function_call = FunctionCall.from_id(job_id)  # job_id is actually the call_id
 
             try:
                 result = function_call.get(timeout=0)
