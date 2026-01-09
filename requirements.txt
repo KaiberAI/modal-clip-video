@@ -5,3 +5,5 @@ requests>=2.31.0
 scenedetect==0.6.1
 opencv-python-headless==4.10.0.84
 boto3>=1.34.0
+google-generativeai>=0.8.0
+python-dotenv>=1.0.0

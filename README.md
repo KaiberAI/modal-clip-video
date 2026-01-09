@@ -1,332 +1,312 @@
-# Video Scenes Modal Project
+# Modal Clip Video API Interface
 
-A Modal AI deployment for video scene detection and splitting, extracted from the mirror-api project.
+This document defines the interface requirements for the Modal service that handles video clipping functionality.
 
-## Overview
-
-This Modal project provides endpoints for:
-- **Scene-based splitting**: Automatically detect and split videos into scenes using PySceneDetect
-
-Both operations support:
-- **Fast mode**: Keyframe-aligned stream copy (very fast, approximate cuts)
-- **Precision mode**: Re-encode for exact frame-accurate cuts (slower, higher CPU)
-
-## Features
-
-- **High-performance scene detection**: Uses PySceneDetect's ContentDetector with automatic threshold selection
-- **Flexible export modes**: Choose between speed (fast) or accuracy (precision)
-- **Cloudflare R2 storage**: Clips are stored in R2 with CDN access (same pattern as modal-gen-media-thumbnails)
-- **Asynchronous processing**: Submit jobs and poll for completion
-- **RESTful API**: Clean FastAPI endpoints for integration
-
-## Project Structure
+## Base URL
 
 ```
-.
-├── modal_video_scenes.py    # Main Modal app with endpoints
-├── env_vars.py              # Environment variable handling for R2
-├── requirements.txt          # Python dependencies
-├── README.md                # This file
-└── services/                # Core processing modules
-    ├── __init__.py
-    ├── scenes.py            # Scene detection logic
-    └── ffmpeg_utils.py      # FFmpeg utilities
+https://kaiber-ai--clip-video-fastapi-app.modal.run
 ```
 
-## Deployment
+---
 
-### Prerequisites
+## Endpoints
 
-1. Install Modal:
-   ```bash
-   pip install modal
-   ```
+### 1. Start Clip Video Job
 
-2. Authenticate with Modal:
-   ```bash
-   modal token new
-   ```
+Initiates a new video clipping job.
 
-3. Set up R2 credentials in Modal secrets:
-   
-   The project uses the `kaiber-secrets` Modal secret (same as other projects).
-   Ensure it contains:
-   - `R2_ACCESS_KEY_ID`: Your Cloudflare R2 access key ID
-   - `R2_SECRET_ACCESS_KEY`: Your Cloudflare R2 secret access key
-   - `R2_ENDPOINT_URL`: R2 endpoint URL (optional, has default)
-   - `R2_BUCKET_NAME`: R2 bucket name (optional, has default)
-   - `R2_PUBLIC_CDN_URL`: Public CDN URL for serving files (optional, has default)
+**Endpoint:** `POST /start`
 
-### Deploy
-
-```bash
-modal deploy modal_video_scenes.py
+**Request Headers:**
+```
+Content-Type: application/json
 ```
 
-After deployment, you'll get a URL like:
-```
-https://your-username--clip-video-fastapi-app.modal.run
-```
-
-### Test Locally
-
-```bash
-# Test scene splitting
-modal run modal_video_scenes.py --video-url "https://example.com/video.mp4" --threshold auto
-```
-
-## API Endpoints
-
-### POST `/start`
-
-Split a video into scene-based clips.
-
-**Request:**
+**Request Body:**
 ```json
 {
-  "url": "https://example.com/video.mp4",
-  "threshold": "auto",
-  "min_scene_ms": 3000,
-  "include_audio": true,
-  "mode": "fast"
+  "url": "https://example.com/video.mp4"
 }
 ```
 
-**Response:**
+**Request Schema:**
+| Field | Type   | Required | Description                    |
+|-------|--------|----------|--------------------------------|
+| `url` | string | Yes      | The URL of the video to clip   |
+
+**Response (Success - 200 OK):**
 ```json
 {
-  "workflow_name": "clip-video-split",
-  "job_id": "call-xxxxx",
-  "start_time": "2025-01-17T12:34:56.789123"
+  "job_id": "uuid-string",
+  "start_time": "2024-01-08T12:00:00.000Z"
 }
 ```
 
-**Note:** The `job_id` returned is the Modal call_id, which should be used for status checking.
+**Response Schema:**
+| Field        | Type   | Required | Description                                      |
+|--------------|--------|----------|--------------------------------------------------|
+| `job_id`     | string | Yes      | Unique identifier for the clipping job           |
+| `start_time` | string | No       | ISO 8601 timestamp when the job started          |
 
-**Parameters:**
-- `url` (string, required): Direct HTTP(S) URL to video file
-- `threshold` (string, optional): Scene detection threshold - `"auto"` or a numeric value (default: auto-select)
-- `min_scene_ms` (int, optional): Minimum scene duration in milliseconds (default: 3000)
-- `include_audio` (bool, optional): Include audio in clips (default: true)
-- `mode` (string, optional): `"fast"` or `"precision"` (default: `"fast"`)
+**Error Response:**
+- Returns non-200 status code on failure
+- Error details should be included in response body
 
-### GET `/status/{job_id}`
+---
 
-Check the status of a processing job using the `job_id` from the start response.
+### 2. Get Clip Video Job Status
 
-**Response (Success):**
+Retrieves the current status of a clipping job.
+
+**Endpoint:** `GET /status/{job_id}`
+
+**Path Parameters:**
+| Parameter | Type   | Required | Description                          |
+|-----------|--------|----------|--------------------------------------|
+| `job_id`  | string | Yes      | The job ID returned from `/start`    |
+
+**Request Headers:**
+```
+Content-Type: application/json
+```
+
+**Response (Processing/Queued):**
 ```json
 {
-  "status": "done",
-  "result": {
-    "job_id": "20250117_abc12345",
-    "usedThreshold": 27.5,
-    "clips": [
-      {
-        "startMs": 0,
-        "endMs": 3000,
-        "durationMs": 3000,
-        "fileName": "video-scene-000.mp4",
-        "sizeBytes": 1234567,
-        "storageProvider": "r2",
-        "gsUri": "r2://bucket-name/video-clips/20250117_abc12345/video-scene-000.mp4",
-        "objectName": "video-clips/20250117_abc12345/video-scene-000.mp4",
-        "publicUrl": "https://media.kybercorp.org/video-clips/20250117_abc12345/video-scene-000.mp4",
-        "mimeType": "video/mp4",
-        "downloadUrl": "/clips/20250117_abc12345/video-scene-000.mp4"
-      }
-    ]
-  }
+  "status": "processing",
+  "progress": 45,
+  "created_at": "2024-01-08T12:00:00.000Z"
 }
 ```
 
-**Note:** Clips are served via the public CDN URL returned in the `publicUrl` field. No separate download endpoint is needed - use the `publicUrl` directly.
+**Response Schema (Processing):**
+| Field        | Type   | Required | Description                                   |
+|--------------|--------|----------|-----------------------------------------------|
+| `status`     | string | Yes      | Must be "processing" or "queued"              |
+| `progress`   | number | No       | Progress percentage (0-100), defaults to 0    |
+| `created_at` | string | No       | ISO 8601 timestamp when job was created       |
 
-## Usage Examples
+---
 
-### JavaScript/TypeScript
-
-```javascript
-// Start a scene splitting job
-async function splitVideo(videoUrl) {
-  const response = await fetch(`${MODAL_API_URL}/start`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      url: videoUrl,
-      threshold: "auto",
-      min_scene_ms: 3000,
-      include_audio: true,
-      mode: "fast"
-    })
-  });
-  
-  const { job_id } = await response.json();
-  
-  // Poll for completion
-  let status = "pending";
-  while (status === "pending") {
-    await new Promise(resolve => setTimeout(resolve, 3000));
-    const statusResponse = await fetch(`${MODAL_API_URL}/status/${job_id}`);
-    const data = await statusResponse.json();
-    status = data.status;
-    
-    if (status === "done") {
-      console.log(`Found ${data.result.clips.length} scenes`);
-      // Access clips via public CDN URLs
-      for (const clip of data.result.clips) {
-        console.log(`Clip URL: ${clip.publicUrl}`);
-      }
+**Response (Completed):**
+```json
+{
+  "status": "completed",
+  "created_at": "2024-01-08T12:00:00.000Z",
+  "scenes": [
+    {
+      "scene_number": 1,
+      "title": "Scene 1",
+      "url": "https://example.com/clip1.mp4",
+      "video_url": "https://example.com/clip1.mp4",
+      "duration": 5.5,
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "scene_number": 2,
+      "title": "Scene 2",
+      "url": "https://example.com/clip2.mp4",
+      "video_url": "https://example.com/clip2.mp4",
+      "duration": 3.2,
+      "width": 1920,
+      "height": 1080
     }
-  }
+  ]
 }
 ```
 
-### Python
+**Response Schema (Completed):**
+| Field        | Type   | Required | Description                                   |
+|--------------|--------|----------|-----------------------------------------------|
+| `status`     | string | Yes      | Must be "completed"                           |
+| `created_at` | string | No       | ISO 8601 timestamp when job was created       |
+| `scenes`     | array  | Yes      | Array of clipped video scenes (can be empty)  |
 
-```python
-import modal
-import requests
-import time
+**Scene Object Schema:**
+| Field          | Type   | Required | Description                                  |
+|----------------|--------|----------|----------------------------------------------|
+| `scene_number` | number | No       | Sequential scene number                      |
+| `title`        | string | No       | Human-readable title for the scene           |
+| `url`          | string | Yes*     | URL to the clipped video file                |
+| `video_url`    | string | Yes*     | Alternative field for video URL              |
+| `duration`     | number | No       | Duration of clip in seconds                  |
+| `width`        | number | No       | Video width in pixels                        |
+| `height`       | number | No       | Video height in pixels                       |
 
-# Get the Modal function
-VideoScenes = modal.Cls.lookup("clip-video", "VideoScenes")
+\* At least one of `url` or `video_url` must be provided
 
-# Create instance and process
-detector = VideoScenes()
-job_id = "test_123"  # Generate your own job_id
-result = detector.split_video_on_scenes.remote(
-    video_url="https://example.com/video.mp4",
-    job_id=job_id,
-    threshold="auto",
-    min_scene_ms=3000,
-    include_audio=True,
-    mode="fast"
-)
+---
 
-print(f"Detected {len(result['clips'])} scenes")
-print(f"Used threshold: {result['usedThreshold']}")
+**Response (Failed):**
+```json
+{
+  "status": "failed",
+  "error": "Error message describing what went wrong",
+  "created_at": "2024-01-08T12:00:00.000Z"
+}
 ```
 
-### curl
+**Response Schema (Failed):**
+| Field        | Type   | Required | Description                                   |
+|--------------|--------|----------|-----------------------------------------------|
+| `status`     | string | Yes      | Must be "failed"                              |
+| `error`      | string | No       | Error message, defaults to "Unknown error"    |
+| `created_at` | string | No       | ISO 8601 timestamp when job was created       |
+
+---
+
+## Status Flow
+
+1. **Job Created** → Status: `"queued"` or `"processing"`
+2. **Job In Progress** → Status: `"processing"` with increasing `progress` (0-100)
+3. **Job Complete** → Status: `"completed"` with `scenes` array
+4. **Job Failed** → Status: `"failed"` with `error` message
+
+---
+
+## Integration Notes
+
+### Server-Side Behavior (ClipVideoService)
+
+The Kaiber server (`ClipVideoService.ts`) performs the following transformations:
+
+1. **On Start:**
+   - Sends `{ url: source }` to Modal `/start`
+   - Receives `{ job_id, start_time }` from Modal
+   - Returns `{ jobId, createdAt }` to client
+
+2. **On Status Check:**
+   - Sends GET to Modal `/status/{jobId}`
+   - Transforms Modal response to internal schema
+   - **On Completed:** Creates MongoDB Media documents for each scene
+   - Returns standardized response to client
+
+3. **Media Creation:**
+   - Each scene becomes a `Media` document with:
+     - New `mediaId` (UUID v4)
+     - `type: MediaType.Video`
+     - `path.key: scene.url` or `scene.video_url`
+     - Thumbnail generation via `genThumbnailForMedia`
+
+### Error Handling
+
+- Non-200 responses throw `InternalServerErrorException`
+- Missing scenes array defaults to empty array `[]`
+- Missing optional fields use sensible defaults:
+  - `progress`: defaults to `0`
+  - `error`: defaults to `"Unknown error"`
+  - `created_at`: defaults to current server time
+
+---
+
+## Gemini Video Processing (NEW)
+
+### Overview
+
+The Modal app now includes a `process_video_with_gemini` function that:
+1. Takes a video URL
+2. Transcodes it to 720p using FFmpeg
+3. Streams the video to Google's Gemini File API
+4. Polls until the file is ACTIVE
+5. Uses `gemini-2.0-flash-exp` to analyze the video and extract scene timestamps
+6. Returns structured JSON with scene boundaries and descriptions
+
+### Direct Function Call
+
+You can call the Gemini processing function directly using Modal CLI:
 
 ```bash
-# Start split job
-curl -X POST "${MODAL_API_URL}/start" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "url": "https://example.com/video.mp4",
-    "threshold": "auto",
-    "min_scene_ms": 3000,
-    "include_audio": true,
-    "mode": "fast"
-  }'
-
-# Check status (use job_id from response)
-curl "${MODAL_API_URL}/status/JOB_ID"
-
-# Download clip (use publicUrl from status result)
-curl "https://media.kybercorp.org/video-clips/JOB_ID/video-scene-000.mp4" -o clip.mp4
+modal run test_gemini_processing.py --video-url "https://example.com/video.mp4"
 ```
 
-## Configuration
+Or use the default Big Buck Bunny sample video:
 
-### Machine Resources
+```bash
+modal run test_gemini_processing.py
+```
 
-The Modal class is configured with:
-- **CPU**: 8 cores (good for scene detection and encoding)
-- **Timeout**: 1 hour per job
-- **Scaledown**: 5 minutes of idle time before container shutdown
+### Using with /start Endpoint
 
-### Storage
+The `/start` endpoint now accepts an optional `use_gemini` flag:
 
-Clips are stored in Cloudflare R2 (same pattern as modal-gen-media-thumbnails):
-- Clips are uploaded to R2 at `video-clips/{job_id}/{filename}.mp4`
-- Public URLs are generated using the CDN: `{R2_PUBLIC_CDN_URL}/video-clips/{job_id}/{filename}.mp4`
-- Files are accessible via the `publicUrl` field in the response
+```bash
+curl -X POST https://kaiber-ai--clip-video-fastapi-app.modal.run/start \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com/video.mp4", "use_gemini": true}'
+```
 
-### Video Download Limits
+When `use_gemini: true`, the function spawns an async Modal container to process the video with Gemini.
 
-- **Max file size**: 500MB (524288000 bytes)
-- **Download timeout**: 300 seconds
-- **Retry attempts**: 5 with exponential backoff
+### Output Format
 
-## Export Modes
+The Gemini processing function returns JSON with scene timestamps:
 
-### Fast Mode (default)
+```json
+[
+  {
+    "start_time": 0.0,
+    "end_time": 5.5,
+    "title": "Opening Scene",
+    "description": "Introduction with title card"
+  },
+  {
+    "start_time": 5.5,
+    "end_time": 12.3,
+    "title": "Main Content",
+    "description": "Person speaking to camera"
+  }
+]
+```
 
-- Uses keyframe-aligned stream copy
-- Very fast processing
-- Cuts may be slightly before/after requested times (aligned to nearest keyframe)
-- No re-encoding, preserves original quality
-- Best for: Quick previews, rough cuts, minimizing processing time
+### Requirements
 
-### Precision Mode
+1. **Modal Secret**: Create a Modal secret named `gemini-secret` with your `GEMINI_API_KEY`:
+   ```bash
+   modal secret create gemini-secret GEMINI_API_KEY=your-api-key-here
+   ```
 
-- Re-encodes segments for exact frame-accurate cuts
-- Slower processing (CPU-intensive)
-- Exact start/end times as specified
-- Slight quality loss from re-encoding
-- Best for: Final exports, exact timing requirements
+2. **FFmpeg**: Automatically installed in the Modal container image
 
-## Scene Detection
+3. **Google Generative AI SDK**: Automatically installed via requirements.txt
 
-The scene detection uses PySceneDetect's ContentDetector:
+### Logs
 
-1. **Auto threshold selection** (default):
-   - Analyzes video content statistics
-   - Selects optimal threshold from upper percentiles
-   - Ensures minimum scene duration is respected
-   - Recommended for most videos
+All processing steps are logged to Modal logs:
+- FFmpeg transcode progress
+- Gemini File API upload status
+- Polling for ACTIVE state
+- Final JSON timestamps (printed to logs)
 
-2. **Manual threshold**:
-   - Provide a numeric value (e.g., `"27.5"`)
-   - Lower values = more sensitive (more scenes)
-   - Higher values = less sensitive (fewer scenes)
-   - Typical range: 20-35
+Access logs via Modal dashboard or CLI:
+```bash
+modal logs clip-video
+```
 
-## Performance
+---
 
-Processing time depends on:
-- Video length and resolution
-- Number of scenes/clips
-- Export mode (fast vs precision)
-- Video codec complexity
+## Testing
 
-**Typical performance** (8-core CPU):
-- 1-minute video, fast mode: ~5-10 seconds
-- 5-minute video, fast mode: ~20-40 seconds
-- 1-minute video, precision mode: ~30-60 seconds
-- 5-minute video, precision mode: ~3-5 minutes
+### Example: Start a Job
 
-## Troubleshooting
+```bash
+curl -X POST https://kaiber-ai--clip-video-fastapi-app.modal.run/start \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com/video.mp4"}'
+```
 
-### Common Issues
+### Example: Start a Job with Gemini Processing
 
-1. **Download failures**:
-   - Verify video URL is accessible
-   - Check file size is under 500MB
-   - Ensure URL returns video content (not HTML)
+```bash
+curl -X POST https://kaiber-ai--clip-video-fastapi-app.modal.run/start \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com/video.mp4", "use_gemini": true}'
+```
 
-2. **No scenes detected**:
-   - Try a lower threshold value
-   - Reduce `min_scene_ms` if scenes are too short
-   - Verify video has clear scene changes
+### Example: Check Status
 
-3. **Slow processing**:
-   - Normal for long videos or precision mode
-   - Consider splitting long videos into chunks
-   - Use fast mode if exact timing isn't critical
-
-4. **Import errors**:
-   - Ensure all dependencies are installed in Modal image
-   - Check that module files are correctly copied
-   - Verify Python version compatibility (3.12)
-
-## License
-
-This project is extracted from the mirror-api codebase.
-
-## Support
-
-For issues or questions, refer to Modal's documentation at https://modal.com/docs.
+```bash
+curl -X GET https://kaiber-ai--clip-video-fastapi-app.modal.run/status/{job_id} \
+  -H "Content-Type: application/json"
+```

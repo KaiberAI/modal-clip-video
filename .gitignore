@@ -39,3 +39,9 @@ Thumbs.db
 
 # Modal
 .modal/
+
+# Environment files (matching modal-gen-media-thumbnails pattern)
+.env*
+.flaskenv*
+!.env.project
+!.env.vault
