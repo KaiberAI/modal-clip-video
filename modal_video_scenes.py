@@ -10,6 +10,23 @@ from typing import Dict, Any, List
 
 import modal
 
+# Import environment variables
+try:
+    from env_vars import (
+        R2_ACCESS_KEY_ID,
+        R2_SECRET_ACCESS_KEY,
+        R2_ENDPOINT_URL,
+        R2_BUCKET_NAME,
+        GOOGLE_GEMINI_API_KEY,
+    )
+except ImportError:
+    # Fallback for local execution or if env_vars is not yet available
+    R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
+    R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
+    R2_ENDPOINT_URL = os.environ.get("R2_ENDPOINT_URL", "")
+    R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "")
+    GOOGLE_GEMINI_API_KEY = os.environ.get("GOOGLE_GEMINI_API_KEY", "")
+
 # 1. SHARED STORAGE & APP CONFIG
 # Volume for shared high-res videos between coordinator and parallel workers
 video_storage = modal.Volume.from_name("high-res-videos", create_if_missing=True)
@@ -17,15 +34,25 @@ app = modal.App("clip-video")
 
 # Image containing all required binaries and libraries
 image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .apt_install("ffmpeg")
+    modal.Image.debian_slim(python_version="3.10")
+    .apt_install("ffmpeg", "git", "nodejs", "npm")  # nodejs/npm required for dotenv-vault CLI
     .pip_install(
         "fastapi", 
         "google-genai", 
         "requests", 
         "yt-dlp", 
-        "boto3"
+        "boto3",
+        "python-dotenv",
     )
+    .run_commands("pip uninstall -y bson || true")
+    .add_local_file("env_vars.py", "/root/env_vars.py", copy=True)
+    .add_local_file(".env.vault", "/root/.env.vault", copy=True)
+)
+
+# Install kaiber-utils from repo
+image = image.run_commands(
+    "pip install git+https://$GITHUB_TOKEN@github.com/KaiberAI/kaiber-utils.git",
+    secrets=[modal.Secret.from_name("kaiber-secrets")],
 )
 
 # 2. FAN-OUT WORKER: Cut and Upload to R2
@@ -62,21 +89,20 @@ def cut_and_upload_clip(scene: Dict[str, Any], input_path: str) -> Dict[str, Any
     # Initialize R2 Client (S3 Compatible)
     s3 = boto3.client(
         "s3",
-        endpoint_url=f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
-        aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
-        aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
+        endpoint_url=R2_ENDPOINT_URL,
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
         config=Config(signature_version="s3v4"),
         region_name="auto" 
     )
 
     # Upload to R2
-    bucket_name = os.environ["R2_BUCKET_NAME"]
-    s3.upload_file(local_output_path, bucket_name, clip_filename)
+    s3.upload_file(local_output_path, R2_BUCKET_NAME, clip_filename)
 
     # Generate Presigned URL (Valid for 24 hours)
     presigned_url = s3.generate_presigned_url(
         "get_object",
-        Params={"Bucket": bucket_name, "Key": clip_filename},
+        Params={"Bucket": R2_BUCKET_NAME, "Key": clip_filename},
         ExpiresIn=86400 
     )
 
@@ -116,7 +142,7 @@ async def process_video_with_gemini(url: str) -> List[Dict[str, Any]]:
     from google import genai
     from google.genai import types
 
-    client = genai.Client(api_key=os.environ["GOOGLE_GEMINI_API_KEY"])
+    client = genai.Client(api_key=GOOGLE_GEMINI_API_KEY)
     video_id = str(uuid.uuid4())
     high_res_path = f"/videos/{video_id}.mp4"
 
