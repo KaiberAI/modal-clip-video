@@ -152,7 +152,7 @@ Gemini API has rate limits. If you hit them:
 1. **FFmpeg Transcoding**: The video is downloaded and transcoded to 720p H.264 with AAC audio
 2. **Streaming to Gemini**: The transcoded video is streamed directly to Gemini File API (no local storage)
 3. **Polling**: The function polls every 5 seconds until Gemini finishes processing the video
-4. **AI Analysis**: Gemini's `gemini-2.0-flash-exp` model analyzes the video and identifies scene boundaries
+4. **AI Analysis**: Gemini's `gemini-2.5-flash-lite` model analyzes the video and identifies scene boundaries
 5. **JSON Extraction**: The response is parsed and cleaned to extract pure JSON
 6. **Cleanup**: The uploaded file is deleted from Gemini to save quota
 

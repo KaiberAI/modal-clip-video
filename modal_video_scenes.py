@@ -10,37 +10,87 @@ from typing import Dict, Any, List
 
 import modal
 
-# 1. Shared Storage
+# 1. SHARED STORAGE & APP CONFIG
+# Volume for shared high-res videos between coordinator and parallel workers
 video_storage = modal.Volume.from_name("high-res-videos", create_if_missing=True)
 app = modal.App("clip-video")
 
+# Image containing all required binaries and libraries
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg")
-    .pip_install("fastapi", "google-genai", "requests", "yt-dlp")
+    .pip_install(
+        "fastapi", 
+        "google-genai", 
+        "requests", 
+        "yt-dlp", 
+        "boto3"
+    )
 )
 
-# 2. FAN-OUT WORKER: This cuts the actual clips
-@app.function(image=image, volumes={"/videos": video_storage})
-def cut_clip(scene: Dict[str, Any], input_path: str):
-    """Runs in parallel for every scene identified by Gemini."""
+# 2. FAN-OUT WORKER: Cut and Upload to R2
+@app.function(
+    image=image, 
+    volumes={"/videos": video_storage},
+    secrets=[modal.Secret.from_name("kaiber-secrets")], # Contains Gemini & R2 keys
+    cpu=1.0 
+)
+def cut_and_upload_clip(scene: Dict[str, Any], input_path: str) -> Dict[str, Any]:
+    """Runs in parallel for every scene: Clips via FFmpeg and uploads to R2."""
     import subprocess
-    clip_id = str(uuid.uuid4())[:8]
-    output_path = f"/videos/clip_{clip_id}.mp4"
+    import boto3
+    from botocore.config import Config
+
+    clip_id = f"{uuid.uuid4().hex[:10]}"
+    clip_filename = f"clip_{clip_id}.mp4"
+    local_output_path = f"/videos/{clip_filename}"
     
-    # Fast Seek (-ss BEFORE -i)
+    # Fast Seek (-ss before -i) + Stream Copy (-c copy)
     cmd = [
         "ffmpeg", "-y",
-        "-ss", str(scene["start_time"]),
+        "-ss", str(scene["start_time"]), 
         "-i", input_path,
         "-to", str(scene["end_time"]),
-        "-c", "copy", # No re-encoding = instant speed
-        output_path
+        "-c", "copy",
+        "-map_metadata", "0",
+        "-movflags", "+faststart",
+        local_output_path
     ]
+    
     subprocess.run(cmd, check=True)
-    return output_path
 
-# 3. HELPER: Track B (Download)
+    # Initialize R2 Client (S3 Compatible)
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
+        aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
+        config=Config(signature_version="s3v4"),
+        region_name="auto" 
+    )
+
+    # Upload to R2
+    bucket_name = os.environ["R2_BUCKET_NAME"]
+    s3.upload_file(local_output_path, bucket_name, clip_filename)
+
+    # Generate Presigned URL (Valid for 24 hours)
+    presigned_url = s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": bucket_name, "Key": clip_filename},
+        ExpiresIn=86400 
+    )
+
+    # Cleanup Volume storage
+    if os.path.exists(local_output_path):
+        os.remove(local_output_path)
+
+    return {
+        **scene,
+        "clip_url": presigned_url,
+        "filename": clip_filename
+    }
+
+# 3. TRACK B HELPER: High-Res Download
 async def download_high_res_video(url: str, output_path: str):
     import yt_dlp
     ydl_opts = {
@@ -51,10 +101,11 @@ async def download_high_res_video(url: str, output_path: str):
     def download():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
+        video_storage.commit()
+    
     await asyncio.to_thread(download)
-    video_storage.commit() # Important: Flush to Volume
 
-# 4. COORDINATOR: Track A (Gemini) + Fan-out Trigger
+# 4. COORDINATOR: Track A (Gemini) + Parallel Fan-out Orchestration
 @app.function(
     image=image,
     secrets=[modal.Secret.from_name("kaiber-secrets")],
@@ -66,12 +117,13 @@ async def process_video_with_gemini(url: str) -> List[Dict[str, Any]]:
     from google.genai import types
 
     client = genai.Client(api_key=os.environ["GOOGLE_GEMINI_API_KEY"])
-    
-    # FIX: Ensure path is on the Volume, not /tmp
     video_id = str(uuid.uuid4())
     high_res_path = f"/videos/{video_id}.mp4"
 
     async def perform_gemini_analysis():
+        from google.genai import types
+        
+        # 1. FFmpeg 1 FPS Stream logic
         ffmpeg_cmd = [
             "ffmpeg", "-i", url,
             "-vf", "scale=1280:-2,fps=1", 
@@ -96,30 +148,120 @@ async def process_video_with_gemini(url: str) -> List[Dict[str, Any]]:
             if file_info.state.name == "ACTIVE": break
             await asyncio.sleep(2)
         
-        prompt = "Identify scenes. Return JSON: [{'start_time': sec, 'end_time': sec, 'title': str}]"
-        response = client.models.generate_content(model="gemini-2.5-flash-lite", contents=[file_info, prompt])
+        # 2. Define the Schema for Structured Output
+        # This mathematically guarantees valid JSON and correct key names
+        response_schema = {
+            "type": "OBJECT",
+            "properties": {
+                "scenes": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "start_time": {"type": "NUMBER"},
+                            "end_time": {"type": "NUMBER"},
+                            "title": {"type": "STRING"},
+                        },
+                        "required": ["start_time", "end_time", "title"]
+                    }
+                }
+            },
+            "required": ["scenes"]
+        }
+
+        prompt = "Analyze the video and identify distinct scenes with timestamps."
         
-        timestamps = json.loads(response.text.replace("```json", "").replace("```", "").strip())
-        client.files.delete(name=video_file.name)
+        # 3. Requesting the content with Structured Config
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents=[file_info, prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=response_schema,
+                temperature=0.1, # Lower temperature = higher consistency
+                safety_settings=[
+                    types.SafetySetting(
+                        category="HARM_CATEGORY_HARASSMENT",
+                        threshold="BLOCK_NONE",
+                    ),
+                    types.SafetySetting(
+                        category="HARM_CATEGORY_HATE_SPEECH",
+                        threshold="BLOCK_NONE",
+                    ),
+                    types.SafetySetting(
+                        category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                        threshold="BLOCK_NONE",
+                    ),
+                    types.SafetySetting(
+                        category="HARM_CATEGORY_DANGEROUS_CONTENT",
+                        threshold="BLOCK_NONE",
+                    ),  
+                ]
+            )
+        )
+        
+        # 4. Cleanup and Parsing
+        try:
+            # Check for parsed object first
+            if hasattr(response, 'parsed') and response.parsed is not None:
+                # If we wrapped it in 'scenes', we extract it here
+                raw_data = response.parsed
+                # Handle both dict and object-style access
+                timestamps = raw_data.get("scenes", []) if isinstance(raw_data, dict) else getattr(raw_data, "scenes", [])
+            else:
+                # Fallback to text with a default empty object
+                data = json.loads(response.text or '{"scenes": []}')
+                timestamps = data.get("scenes", [])
+        except Exception as e:
+            print(f"JSON Bug caught: {e}. Raw: {response.text}")
+            timestamps = []
+        finally:
+            client.files.delete(name=video_file.name)
+            
         return timestamps
 
     try:
-        # Run Tracks A & B in parallel
+        # EXECUTE TRACKS A & B IN PARALLEL
+        # This is where we save the 60-90 seconds of download latency
         _, timestamps = await asyncio.gather(
             download_high_res_video(url, high_res_path),
             perform_gemini_analysis()
         )
         
-        # FAN-OUT: Trigger parallel clipping workers
-        print(f"Starting fan-out for {len(timestamps)} clips...")
-        # map() handles the distribution automatically
-        clip_paths = list(cut_clip.map(timestamps, kwargs={"input_path": high_res_path}))
+        # 5. TRIGGER FAN-OUT
+        print(f"Analysis complete. Clipping {len(timestamps)} scenes in parallel...")
+        # map() handles massive scale automatically
+        final_clips = []
+        async for clip in cut_and_upload_clip.map.aio(timestamps, kwargs={"input_path": high_res_path}):
+            final_clips.append(clip)
         
-        for i, ts in enumerate(timestamps):
-            ts["clip_path"] = clip_paths[i]
+        # Cleanup original high-res video from Volume
+        if os.path.exists(high_res_path):
+            os.remove(high_res_path)
+            video_storage.commit()
 
-        return timestamps
+        return final_clips
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Pipeline Error: {e}")
         raise
+
+# 6. WEB INTERFACE
+@app.function(image=image)
+@modal.asgi_app()
+def fastapi_app():
+    from fastapi import FastAPI
+    from pydantic import BaseModel
+    web_app = FastAPI(title="AI Video Clipping API")
+
+    class StartRequest(BaseModel):
+        url: str
+
+    @web_app.post("/start")
+    async def start_job(data: StartRequest):
+        # We use .spawn() to trigger the job and return immediately
+        job = process_video_with_gemini.spawn(data.url)
+        return {"job_id": job.object_id, "status": "processing"}
+
+    return web_app
+    
