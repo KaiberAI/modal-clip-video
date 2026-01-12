@@ -10,23 +10,6 @@ from typing import Dict, Any, List
 
 import modal
 
-# Import environment variables
-try:
-    from env_vars import (
-        R2_ACCESS_KEY_ID,
-        R2_SECRET_ACCESS_KEY,
-        R2_ENDPOINT_URL,
-        R2_BUCKET_NAME,
-        GOOGLE_GEMINI_API_KEY,
-    )
-except ImportError:
-    # Fallback for local execution or if env_vars is not yet available
-    R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
-    R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
-    R2_ENDPOINT_URL = os.environ.get("R2_ENDPOINT_URL", "")
-    R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "")
-    GOOGLE_GEMINI_API_KEY = os.environ.get("GOOGLE_GEMINI_API_KEY", "")
-
 # 1. SHARED STORAGE & APP CONFIG
 # Volume for shared high-res videos between coordinator and parallel workers
 video_storage = modal.Volume.from_name("high-res-videos", create_if_missing=True)
@@ -68,6 +51,11 @@ def cut_and_upload_clip(scene: Dict[str, Any], input_path: str) -> Dict[str, Any
     import boto3
     import hashlib
     from botocore.config import Config
+    from env_vars import config
+    R2_ENDPOINT_URL = config.R2_ENDPOINT_URL
+    R2_ACCESS_KEY_ID = config.R2_ACCESS_KEY_ID
+    R2_SECRET_ACCESS_KEY = config.R2_SECRET_ACCESS_KEY
+    R2_BUCKET_NAME = config.R2_BUCKET_NAME
 
     # Generate unique hash for filename
     file_hash = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
@@ -146,6 +134,8 @@ async def download_high_res_video(url: str, output_path: str):
 async def process_video_with_gemini(url: str) -> List[Dict[str, Any]]:
     from google import genai
     from google.genai import types
+    from env_vars import config
+    GOOGLE_GEMINI_API_KEY = config.GOOGLE_GEMINI_API_KEY
 
     client = genai.Client(api_key=GOOGLE_GEMINI_API_KEY)
     video_id = str(uuid.uuid4())
@@ -294,18 +284,65 @@ async def process_video_with_gemini(url: str) -> List[Dict[str, Any]]:
 @app.function(image=image)
 @modal.asgi_app()
 def fastapi_app():
-    from fastapi import FastAPI
+    from fastapi import FastAPI, HTTPException
+    from fastapi.responses import JSONResponse
     from pydantic import BaseModel
-    web_app = FastAPI(title="AI Video Clipping API")
+    import modal
+    
+    web_app = FastAPI(title="Beat Sync Video Clipping Worker")
 
     class StartRequest(BaseModel):
         url: str
 
     @web_app.post("/start")
     async def start_job(data: StartRequest):
-        # We use .spawn() to trigger the job and return immediately
+        # Spawn the job and get the call_id
         job = process_video_with_gemini.spawn(data.url)
         return {"job_id": job.object_id, "status": "processing"}
 
+    @web_app.get("/status/{job_id}")
+    async def get_status(job_id: str):
+        try:
+            # Re-instantiate the function call handle
+            function_call = modal.functions.FunctionCall.from_id(job_id)
+            
+            try:
+                # Poll for the result (timeout=0 means don't block)
+                result = function_call.get(timeout=0)
+                
+                # If we reach here, the job is FINISHED
+                # Format the response to match your ClipVideoScene interface
+                scenes = []
+                for i, clip in enumerate(result):
+                    scenes.append({
+                        "title": clip.get("title", f"Scene {i+1}"),
+                        "scene_number": i + 1,
+                        "url": clip.get("clip_url"),
+                        "video_url": clip.get("clip_url"), # Mapping both for your interface
+                        "duration": clip.get("end_time", 0) - clip.get("start_time", 0)
+                    })
+                
+                return {
+                    "status": "completed",
+                    "scenes": scenes,
+                    "progress": 100
+                }
+                
+            except TimeoutError:
+                # Job is still running
+                return {
+                    "status": "processing",
+                    "progress": 50 # Simplified progress
+                }
+                
+        except Exception as e:
+            # Job failed or ID is invalid
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "status": "error",
+                    "error": str(e)
+                }
+            )
+
     return web_app
-    

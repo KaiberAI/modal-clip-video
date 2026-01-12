@@ -229,15 +229,11 @@ modal run test_gemini_processing.py
 
 ### Using with /start Endpoint
 
-The `/start` endpoint now accepts an optional `use_gemini` flag:
-
 ```bash
 curl -X POST https://kaiber-ai--clip-video-fastapi-app.modal.run/start \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://example.com/video.mp4", "use_gemini": true}'
+  -d '{"url": "https://example.com/video.mp4"}'
 ```
-
-When `use_gemini: true`, the function spawns an async Modal container to process the video with Gemini.
 
 ### Output Format
 
@@ -262,14 +258,9 @@ The Gemini processing function returns JSON with scene timestamps:
 
 ### Requirements
 
-1. **Modal Secret**: Create a Modal secret named `gemini-secret` with your `GOOGLE_GEMINI_API_KEY`:
-   ```bash
-   modal secret create gemini-secret GOOGLE_GEMINI_API_KEY=your-api-key-here
-   ```
+1. **FFmpeg**: Automatically installed in the Modal container image
 
-2. **FFmpeg**: Automatically installed in the Modal container image
-
-3. **Google Generative AI SDK**: Automatically installed via requirements.txt
+2. **Google Generative AI SDK**: Automatically installed via requirements.txt
 
 ### Logs
 
@@ -294,14 +285,6 @@ modal logs clip-video
 curl -X POST https://kaiber-ai--clip-video-fastapi-app.modal.run/start \
   -H "Content-Type: application/json" \
   -d '{"url": "https://example.com/video.mp4"}'
-```
-
-### Example: Start a Job with Gemini Processing
-
-```bash
-curl -X POST https://kaiber-ai--clip-video-fastapi-app.modal.run/start \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://example.com/video.mp4", "use_gemini": true}'
 ```
 
 ### Example: Check Status

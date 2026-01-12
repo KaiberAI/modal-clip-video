@@ -72,7 +72,7 @@ Then make a POST request:
 ```bash
 curl -X POST https://kaiber-ai--clip-video-fastapi-app.modal.run/start \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://example.com/video.mp4", "use_gemini": true}'
+  -d '{"url": "https://example.com/video.mp4"}'
 ```
 
 ## Viewing Logs
