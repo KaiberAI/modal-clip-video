@@ -64,7 +64,7 @@ GITHUB_TOKEN = get_env('GITHUB_TOKEN', '')
 SIEVE_WEBHOOK_SECRET = get_env('SIEVE_WEBHOOK_SECRET', '')
 
 # Gemini API
-GEMINI_API_KEY = get_env('GOOGLE_GEMINI_API_KEY', '')
+GOOGLE_GEMINI_API_KEY = get_env('GOOGLE_GEMINI_API_KEY', '')
 
 # Platform Detection
 SIEVE_ENABLED = get_env_bool('SIEVE_ENABLED', False)

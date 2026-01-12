@@ -262,9 +262,9 @@ The Gemini processing function returns JSON with scene timestamps:
 
 ### Requirements
 
-1. **Modal Secret**: Create a Modal secret named `gemini-secret` with your `GEMINI_API_KEY`:
+1. **Modal Secret**: Create a Modal secret named `gemini-secret` with your `GOOGLE_GEMINI_API_KEY`:
    ```bash
-   modal secret create gemini-secret GEMINI_API_KEY=your-api-key-here
+   modal secret create gemini-secret GOOGLE_GEMINI_API_KEY=your-api-key-here
    ```
 
 2. **FFmpeg**: Automatically installed in the Modal container image

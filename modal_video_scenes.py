@@ -66,18 +66,22 @@ def cut_and_upload_clip(scene: Dict[str, Any], input_path: str) -> Dict[str, Any
     """Runs in parallel for every scene: Clips via FFmpeg and uploads to R2."""
     import subprocess
     import boto3
+    import hashlib
     from botocore.config import Config
 
-    clip_id = f"{uuid.uuid4().hex[:10]}"
-    clip_filename = f"clip_{clip_id}.mp4"
+    # Generate unique hash for filename
+    file_hash = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
+    clip_filename = f"{file_hash}.mp4"
     local_output_path = f"/videos/{clip_filename}"
+    r2_key = f"user-videos/temp/{clip_filename}"
     
     # Fast Seek (-ss before -i) + Stream Copy (-c copy)
+    duration = scene["end_time"] - scene["start_time"]
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(scene["start_time"]), 
         "-i", input_path,
-        "-to", str(scene["end_time"]),
+        "-t", str(duration),
         "-c", "copy",
         "-map_metadata", "0",
         "-movflags", "+faststart",
@@ -97,12 +101,12 @@ def cut_and_upload_clip(scene: Dict[str, Any], input_path: str) -> Dict[str, Any
     )
 
     # Upload to R2
-    s3.upload_file(local_output_path, R2_BUCKET_NAME, clip_filename)
+    s3.upload_file(local_output_path, R2_BUCKET_NAME, r2_key)
 
-    # Generate Presigned URL (Valid for 24 hours)
+    # Generate Presigned URL (Valid for 24 hours) - DEBUG only
     presigned_url = s3.generate_presigned_url(
         "get_object",
-        Params={"Bucket": R2_BUCKET_NAME, "Key": clip_filename},
+        Params={"Bucket": R2_BUCKET_NAME, "Key": r2_key},
         ExpiresIn=86400 
     )
 
@@ -113,7 +117,8 @@ def cut_and_upload_clip(scene: Dict[str, Any], input_path: str) -> Dict[str, Any
     return {
         **scene,
         "clip_url": presigned_url,
-        "filename": clip_filename
+        "filename": clip_filename,
+        "r2_key": r2_key
     }
 
 # 3. TRACK B HELPER: High-Res Download
@@ -181,21 +186,33 @@ async def process_video_with_gemini(url: str) -> List[Dict[str, Any]]:
             "properties": {
                 "scenes": {
                     "type": "ARRAY",
+                    "maxItems": 50,  # Enforce a maximum number of scenes
                     "items": {
                         "type": "OBJECT",
                         "properties": {
-                            "start_time": {"type": "NUMBER"},
-                            "end_time": {"type": "NUMBER"},
-                            "title": {"type": "STRING"},
+                            "start_time": {
+                                "type": "NUMBER", 
+                                "description": "Start time in CUMULATIVE SECONDS (e.g., 90.0 for 1:30). Do NOT use decimal minutes."
+                            },
+                            "end_time": {
+                                "type": "NUMBER", 
+                                "description": "End time in CUMULATIVE SECONDS. Must be greater than start_time."
+                            },
                         },
-                        "required": ["start_time", "end_time", "title"]
+                        "required": ["start_time", "end_time"]
                     }
                 }
             },
             "required": ["scenes"]
         }
 
-        prompt = "Analyze the video and identify distinct scenes with timestamps."
+        prompt = """
+        Analyze the video and identify the most important scenes. 
+        IMPORTANT: All timestamps must be in TOTAL SECONDS only. 
+        - 1 minute 15 seconds must be 75.0
+        - 2 minutes must be 120.0
+        Do NOT use decimal minutes like 1.15 or 2.00.
+        """
         
         # 3. Requesting the content with Structured Config
         response = client.models.generate_content(
@@ -205,6 +222,7 @@ async def process_video_with_gemini(url: str) -> List[Dict[str, Any]]:
                 response_mime_type="application/json",
                 response_schema=response_schema,
                 temperature=0.1, # Lower temperature = higher consistency
+                max_output_tokens=8192, # Maximum possible to prevent truncation
                 safety_settings=[
                     types.SafetySetting(
                         category="HARM_CATEGORY_HARASSMENT",
@@ -230,16 +248,16 @@ async def process_video_with_gemini(url: str) -> List[Dict[str, Any]]:
         try:
             # Check for parsed object first
             if hasattr(response, 'parsed') and response.parsed is not None:
-                # If we wrapped it in 'scenes', we extract it here
                 raw_data = response.parsed
-                # Handle both dict and object-style access
                 timestamps = raw_data.get("scenes", []) if isinstance(raw_data, dict) else getattr(raw_data, "scenes", [])
             else:
-                # Fallback to text with a default empty object
-                data = json.loads(response.text or '{"scenes": []}')
+                # Fallback to text parsing with better error reporting
+                clean_text = response.text.strip() if response.text else '{"scenes": []}'
+                data = json.loads(clean_text)
                 timestamps = data.get("scenes", [])
         except Exception as e:
-            print(f"JSON Bug caught: {e}. Raw: {response.text}")
+            print(f"JSON Parsing Error: {e}")
+            print(f"Raw response text (truncated): {response.text[:1000] if response.text else 'Empty'}")
             timestamps = []
         finally:
             client.files.delete(name=video_file.name)

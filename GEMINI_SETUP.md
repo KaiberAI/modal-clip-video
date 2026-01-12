@@ -28,7 +28,7 @@ Follow the prompts to authenticate.
 Create a secret named `gemini-secret` with your Gemini API key:
 
 ```bash
-modal secret create gemini-secret GEMINI_API_KEY=your-api-key-here
+modal secret create gemini-secret GOOGLE_GEMINI_API_KEY=your-api-key-here
 ```
 
 Replace `your-api-key-here` with your actual Gemini API key.
@@ -113,7 +113,7 @@ The function returns JSON with scene timestamps:
 
 ## Troubleshooting
 
-### "GEMINI_API_KEY not found in environment"
+### "GOOGLE_GEMINI_API_KEY not found in environment"
 
 Make sure you created the Modal secret correctly:
 
@@ -124,7 +124,7 @@ modal secret list
 You should see `gemini-secret` in the list. If not, create it:
 
 ```bash
-modal secret create gemini-secret GEMINI_API_KEY=your-key
+modal secret create gemini-secret GOOGLE_GEMINI_API_KEY=your-key
 ```
 
 ### FFmpeg Error
