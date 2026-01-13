@@ -99,14 +99,11 @@ The function returns JSON with scene timestamps:
   {
     "start_time": 0.0,
     "end_time": 5.5,
-    "title": "Opening Scene",
-    "description": "Introduction with title card"
-  },
-  {
-    "start_time": 5.5,
-    "end_time": 12.3,
-    "title": "Main Content",
-    "description": "Person speaking to camera"
+    "url": "https://...",
+    "key": "user-videos/temp/hash.mp4",
+    "width": 1280,
+    "height": 720,
+    "duration": 5.5
   }
 ]
 ```

@@ -19,10 +19,10 @@ class Config:
     def R2_SECRET_ACCESS_KEY(self): return get_env('R2_SECRET_ACCESS_KEY')
     
     @property
-    def R2_ENDPOINT_URL(self): return get_env('R2_ENDPOINT_URL')
+    def R2_ENDPOINT_URL(self): return get_env('R2_ENDPOINT_URL', 'https://3a0e8493c00fa2487b71580016cad807.r2.cloudflarestorage.com')
     
     @property
-    def R2_BUCKET_NAME(self): return get_env('R2_BUCKET_NAME')
+    def R2_BUCKET_NAME(self): return get_env('R2_BUCKET_NAME', 'secret-memories')
     
     @property
     def GOOGLE_GEMINI_API_KEY(self): return get_env('GOOGLE_GEMINI_API_KEY')

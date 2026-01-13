@@ -18,7 +18,7 @@ app = modal.App("clip-video")
 # Image containing all required binaries and libraries
 image = (
     modal.Image.debian_slim(python_version="3.10")
-    .apt_install("ffmpeg", "git", "nodejs", "npm")  # nodejs/npm required for dotenv-vault CLI
+    .apt_install("ffmpeg", "git", "nodejs", "npm")
     .pip_install(
         "fastapi", 
         "google-genai", 
@@ -43,9 +43,11 @@ image = image.run_commands(
     image=image, 
     volumes={"/videos": video_storage},
     secrets=[modal.Secret.from_name("kaiber-secrets")], # Contains Gemini & R2 keys
-    cpu=1.0 
+    cpu=1.0,
+    retries=2,
+    timeout=300
 )
-def cut_and_upload_clip(scene: Dict[str, Any], input_path: str) -> Dict[str, Any]:
+def cut_and_upload_clip(scene: Dict[str, Any], input_path: str, width: int, height: int) -> Dict[str, Any]:
     """Runs in parallel for every scene: Clips via FFmpeg and uploads to R2."""
     import subprocess
     import boto3
@@ -61,7 +63,7 @@ def cut_and_upload_clip(scene: Dict[str, Any], input_path: str) -> Dict[str, Any
     file_hash = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
     clip_filename = f"{file_hash}.mp4"
     local_output_path = f"/videos/{clip_filename}"
-    r2_key = f"user-videos/temp/{clip_filename}"
+    key = f"user-videos/temp/{clip_filename}"
     
     # Fast Seek (-ss before -i) + Stream Copy (-c copy)
     duration = scene["end_time"] - scene["start_time"]
@@ -89,12 +91,12 @@ def cut_and_upload_clip(scene: Dict[str, Any], input_path: str) -> Dict[str, Any
     )
 
     # Upload to R2
-    s3.upload_file(local_output_path, R2_BUCKET_NAME, r2_key)
+    s3.upload_file(local_output_path, R2_BUCKET_NAME, key)
 
     # Generate Presigned URL (Valid for 24 hours) - DEBUG only
     presigned_url = s3.generate_presigned_url(
         "get_object",
-        Params={"Bucket": R2_BUCKET_NAME, "Key": r2_key},
+        Params={"Bucket": R2_BUCKET_NAME, "Key": key},
         ExpiresIn=86400 
     )
 
@@ -104,9 +106,11 @@ def cut_and_upload_clip(scene: Dict[str, Any], input_path: str) -> Dict[str, Any
 
     return {
         **scene,
-        "clip_url": presigned_url,
+        "url": presigned_url,
         "filename": clip_filename,
-        "r2_key": r2_key
+        "key": key,
+        "width": width,
+        "height": height
     }
 
 # 3. TRACK B HELPER: High-Res Download
@@ -124,14 +128,14 @@ async def download_high_res_video(url: str, output_path: str):
     
     await asyncio.to_thread(download)
 
-# 4. COORDINATOR: Track A (Gemini) + Parallel Fan-out Orchestration
+# 5. COORDINATOR: Track A (Gemini) + Parallel Fan-out Orchestration
 @app.function(
     image=image,
     secrets=[modal.Secret.from_name("kaiber-secrets")],
     volumes={"/videos": video_storage},
     timeout=3600,
 )
-async def process_video_with_gemini(url: str) -> List[Dict[str, Any]]:
+async def process_video_with_gemini(url: str, width: int, height: int) -> List[Dict[str, Any]]:
     from google import genai
     from google.genai import types
     from env_vars import config
@@ -261,12 +265,20 @@ async def process_video_with_gemini(url: str) -> List[Dict[str, Any]]:
             download_high_res_video(url, high_res_path),
             perform_gemini_analysis()
         )
-        
+
+    
         # 5. TRIGGER FAN-OUT
         print(f"Analysis complete. Clipping {len(timestamps)} scenes in parallel...")
         # map() handles massive scale automatically
         final_clips = []
-        async for clip in cut_and_upload_clip.map.aio(timestamps, kwargs={"input_path": high_res_path}):
+        async for clip in cut_and_upload_clip.map.aio(
+            timestamps, 
+            kwargs={"input_path": high_res_path, "width": width, "height": height},
+            return_exceptions=True
+        ):
+            if isinstance(clip, Exception):
+                print(f"⚠️ A worker failed to process a clip: {clip}")
+                continue
             final_clips.append(clip)
         
         # Cleanup original high-res video from Volume
@@ -280,69 +292,79 @@ async def process_video_with_gemini(url: str) -> List[Dict[str, Any]]:
         print(f"Pipeline Error: {e}")
         raise
 
-# 6. WEB INTERFACE
+# 7. WEB INTERFACE
 @app.function(image=image)
 @modal.asgi_app()
 def fastapi_app():
-    from fastapi import FastAPI, HTTPException
-    from fastapi.responses import JSONResponse
+    from fastapi import FastAPI
     from pydantic import BaseModel
-    import modal
+    import modal.functions
+    import logging
+    import json
+    import asyncio
+
+    # Set up logging to show in Modal console
+    logger = logging.getLogger("status-logger")
+    logger.setLevel(logging.INFO)
     
     web_app = FastAPI(title="Beat Sync Video Clipping Worker")
 
     class StartRequest(BaseModel):
         url: str
+        width: int
+        height: int
 
     @web_app.post("/start")
     async def start_job(data: StartRequest):
         # Spawn the job and get the call_id
-        job = process_video_with_gemini.spawn(data.url)
+        job = process_video_with_gemini.spawn(data.url, data.width, data.height)
         return {"job_id": job.object_id, "status": "processing"}
 
     @web_app.get("/status/{job_id}")
     async def get_status(job_id: str):
+        print(f"--- Polling status for Job ID: {job_id} ---") # Standard stdout log
+        
         try:
-            # Re-instantiate the function call handle
-            function_call = modal.functions.FunctionCall.from_id(job_id)
+            call = modal.functions.FunctionCall.from_id(job_id)
             
             try:
-                # Poll for the result (timeout=0 means don't block)
-                result = function_call.get(timeout=0)
+                # Poll result (timeout=0 does not block)
+                result = call.get(timeout=0)
                 
-                # If we reach here, the job is FINISHED
-                # Format the response to match your ClipVideoScene interface
-                scenes = []
-                for i, clip in enumerate(result):
-                    scenes.append({
-                        "title": clip.get("title", f"Scene {i+1}"),
-                        "scene_number": i + 1,
-                        "url": clip.get("clip_url"),
-                        "video_url": clip.get("clip_url"), # Mapping both for your interface
-                        "duration": clip.get("end_time", 0) - clip.get("start_time", 0)
-                    })
-                
-                return {
+                # LOG THE RAW RESULT
+                # This helps you see if Gemini/Workers returned what you expected
+                print(f"SUCCESS: Job {job_id} finished. Result count: {len(result) if result else 0}")
+                logger.info(f"Raw Modal Result: {json.dumps(result, indent=2)}")
+
+                response_data = {
                     "status": "completed",
-                    "scenes": scenes,
+                    "scenes": [
+                        {
+                            "key": s.get("key"),
+                            "length": round(float(s.get("end_time", 0)) - float(s.get("start_time", 0)), 2),
+                            "width": s.get("width"),
+                            "height": s.get("height"),
+                            "url": s.get("url")
+                        } for i, s in enumerate(result)
+                    ],
                     "progress": 100
                 }
                 
+                # LOG THE FINAL MAPPED RESPONSE
+                print(f"Final Response sent to client: {len(response_data['scenes'])} scenes")
+                return response_data
+
             except TimeoutError:
-                # Job is still running
-                return {
-                    "status": "processing",
-                    "progress": 50 # Simplified progress
-                }
+                print(f"STILL PROCESSING: Job {job_id} is not yet finished.")
+                return {"status": "processing", "progress": 50}
                 
         except Exception as e:
-            # Job failed or ID is invalid
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "status": "error",
-                    "error": str(e)
-                }
-            )
+            # LOG THE ERROR
+            print(f"ERROR: Job {job_id} failed with exception: {str(e)}")
+            logger.error(f"Stack trace for {job_id}:", exc_info=True)
+            return {
+                "status": "failed", 
+                "error": str(e)
+            }
 
     return web_app

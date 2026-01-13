@@ -93,49 +93,38 @@ Content-Type: application/json
 ```json
 {
   "status": "completed",
-  "created_at": "2024-01-08T12:00:00.000Z",
   "scenes": [
     {
-      "scene_number": 1,
-      "title": "Scene 1",
-      "url": "https://example.com/clip1.mp4",
-      "video_url": "https://example.com/clip1.mp4",
-      "duration": 5.5,
-      "width": 1920,
-      "height": 1080
+      "key": "user-videos/temp/hash1.mp4",
+      "length": 5.5,
+      "width": 1280,
+      "height": 720
     },
     {
-      "scene_number": 2,
-      "title": "Scene 2",
-      "url": "https://example.com/clip2.mp4",
-      "video_url": "https://example.com/clip2.mp4",
-      "duration": 3.2,
-      "width": 1920,
-      "height": 1080
+      "key": "user-videos/temp/hash2.mp4",
+      "length": 3.2,
+      "width": 1280,
+      "height": 720
     }
-  ]
+  ],
+  "progress": 100
 }
 ```
 
 **Response Schema (Completed):**
-| Field        | Type   | Required | Description                                   |
-|--------------|--------|----------|-----------------------------------------------|
-| `status`     | string | Yes      | Must be "completed"                           |
-| `created_at` | string | No       | ISO 8601 timestamp when job was created       |
-| `scenes`     | array  | Yes      | Array of clipped video scenes (can be empty)  |
+| Field      | Type   | Required | Description                                  |
+|------------|--------|----------|----------------------------------------------|
+| `status`   | string | Yes      | Must be "completed"                          |
+| `scenes`   | array  | Yes      | Array of clipped video scenes (can be empty) |
+| `progress` | number | No       | Progress percentage (100 for completed)      |
 
 **Scene Object Schema:**
-| Field          | Type   | Required | Description                                  |
-|----------------|--------|----------|----------------------------------------------|
-| `scene_number` | number | No       | Sequential scene number                      |
-| `title`        | string | No       | Human-readable title for the scene           |
-| `url`          | string | Yes*     | URL to the clipped video file                |
-| `video_url`    | string | Yes*     | Alternative field for video URL              |
-| `duration`     | number | No       | Duration of clip in seconds                  |
-| `width`        | number | No       | Video width in pixels                        |
-| `height`       | number | No       | Video height in pixels                       |
-
-\* At least one of `url` or `video_url` must be provided
+| Field      | Type   | Required | Description                 |
+|------------|--------|----------|-----------------------------|
+| `key`      | string | No       | R2 storage key for the clip |
+| `length`   | number | No       | Duration of clip in seconds |
+| `width`    | number | No       | Video width in pixels       |
+| `height`   | number | No       | Video height in pixels      |
 
 ---
 
@@ -143,25 +132,23 @@ Content-Type: application/json
 ```json
 {
   "status": "failed",
-  "error": "Error message describing what went wrong",
-  "created_at": "2024-01-08T12:00:00.000Z"
+  "error": "Error message describing what went wrong"
 }
 ```
 
 **Response Schema (Failed):**
-| Field        | Type   | Required | Description                                   |
-|--------------|--------|----------|-----------------------------------------------|
-| `status`     | string | Yes      | Must be "failed"                              |
-| `error`      | string | No       | Error message, defaults to "Unknown error"    |
-| `created_at` | string | No       | ISO 8601 timestamp when job was created       |
+| Field    | Type   | Required | Description                                |
+|----------|--------|----------|--------------------------------------------|
+| `status` | string | Yes      | Must be "failed"                           |
+| `error`  | string | No       | Error message, defaults to "Unknown error" |
 
 ---
 
 ## Status Flow
 
-1. **Job Created** → Status: `"queued"` or `"processing"`
-2. **Job In Progress** → Status: `"processing"` with increasing `progress` (0-100)
-3. **Job Complete** → Status: `"completed"` with `scenes` array
+1. **Job Created** → Status: `"processing"`
+2. **Job In Progress** → Status: `"processing"` with `progress` (e.g., 50)
+3. **Job Complete** → Status: `"completed"` with `scenes` array and `progress: 100`
 4. **Job Failed** → Status: `"failed"` with `error` message
 
 ---
@@ -244,14 +231,11 @@ The Gemini processing function returns JSON with scene timestamps:
   {
     "start_time": 0.0,
     "end_time": 5.5,
-    "title": "Opening Scene",
-    "description": "Introduction with title card"
-  },
-  {
-    "start_time": 5.5,
-    "end_time": 12.3,
-    "title": "Main Content",
-    "description": "Person speaking to camera"
+    "url": "https://...",
+    "key": "user-videos/temp/hash.mp4",
+    "width": 1280,
+    "height": 720,
+    "duration": 5.5
   }
 ]
 ```
