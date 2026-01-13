@@ -135,7 +135,7 @@ async def download_high_res_video(url: str, output_path: str):
     volumes={"/videos": video_storage},
     timeout=3600,
 )
-async def process_video_with_gemini(url: str, width: int, height: int) -> List[Dict[str, Any]]:
+async def process_video_with_gemini(url: str, width: int, height: int, target_scene_count: int) -> List[Dict[str, Any]]:
     from google import genai
     from google.genai import types
     from env_vars import config
@@ -145,7 +145,7 @@ async def process_video_with_gemini(url: str, width: int, height: int) -> List[D
     video_id = str(uuid.uuid4())
     high_res_path = f"/videos/{video_id}.mp4"
 
-    async def perform_gemini_analysis():
+    async def perform_gemini_analysis(target_scene_count: int):
         from google.genai import types
         
         # 1. FFmpeg 1 FPS Stream logic
@@ -180,7 +180,7 @@ async def process_video_with_gemini(url: str, width: int, height: int) -> List[D
             "properties": {
                 "scenes": {
                     "type": "ARRAY",
-                    "maxItems": 50,  # Enforce a maximum number of scenes
+                    "maxItems": target_scene_count + 5,  # Enforce a maximum number of scenes
                     "items": {
                         "type": "OBJECT",
                         "properties": {
@@ -200,8 +200,15 @@ async def process_video_with_gemini(url: str, width: int, height: int) -> List[D
             "required": ["scenes"]
         }
 
-        prompt = """
-        Analyze the video and identify the most important scenes. 
+        prompt = f"""
+        You are a precise video scene boundary detector for video editing. Analyze the video and identify the most important scenes. A scene should represent a semantic unit (change in location, time of day, topic, or camera setup), not frame-by-frame changes or tiny motion; ignore flashes, micro-cuts, or edits shorter than a couple of seconds.
+        
+        Guidelines for scene selection:
+        - Aim for approximately {target_scene_count} scenes.
+        - If the video is high-action, you may go slightly over. If it is a slow-paced lecture, you may go slightly under.
+        - Focus on visual transitions, key speaking points, or high-energy moments.
+        - Each scene must be between 2 and 10 seconds long.
+
         IMPORTANT: All timestamps must be in TOTAL SECONDS only. 
         - 1 minute 15 seconds must be 75.0
         - 2 minutes must be 120.0
@@ -263,9 +270,14 @@ async def process_video_with_gemini(url: str, width: int, height: int) -> List[D
         # This is where we save the 60-90 seconds of download latency
         _, timestamps = await asyncio.gather(
             download_high_res_video(url, high_res_path),
-            perform_gemini_analysis()
+            perform_gemini_analysis(target_scene_count)
         )
 
+        # Filter out clips shorter than 2 seconds (and and invalid timestamps)
+        timestamps = [
+            ts for ts in timestamps 
+            if (float(ts.get("end_time", 0)) - float(ts.get("start_time", 0))) >= 2.0
+        ]
     
         # 5. TRIGGER FAN-OUT
         print(f"Analysis complete. Clipping {len(timestamps)} scenes in parallel...")
@@ -274,10 +286,11 @@ async def process_video_with_gemini(url: str, width: int, height: int) -> List[D
         async for clip in cut_and_upload_clip.map.aio(
             timestamps, 
             kwargs={"input_path": high_res_path, "width": width, "height": height},
-            return_exceptions=True
+            return_exceptions=True,            # Don't crash the whole job
+            wrap_returned_exceptions=False     # Return the raw error
         ):
             if isinstance(clip, Exception):
-                print(f"⚠️ A worker failed to process a clip: {clip}")
+                print(f"⚠️ Scene failed: {type(clip).__name__} - {clip}")
                 continue
             final_clips.append(clip)
         
@@ -313,11 +326,12 @@ def fastapi_app():
         url: str
         width: int
         height: int
+        target_scene_count: int
 
     @web_app.post("/start")
     async def start_job(data: StartRequest):
         # Spawn the job and get the call_id
-        job = process_video_with_gemini.spawn(data.url, data.width, data.height)
+        job = process_video_with_gemini.spawn(data.url, data.width, data.height, data.target_scene_count)
         return {"job_id": job.object_id, "status": "processing"}
 
     @web_app.get("/status/{job_id}")
