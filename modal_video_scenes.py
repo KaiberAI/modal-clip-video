@@ -180,7 +180,7 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
             "properties": {
                 "scenes": {
                     "type": "ARRAY",
-                    "maxItems": target_scene_count + 5,  # Enforce a maximum number of scenes
+                    "maxItems": target_scene_count,  # Enforce a maximum number of scenes
                     "items": {
                         "type": "OBJECT",
                         "properties": {
@@ -201,28 +201,39 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
         }
 
         prompt = f"""
-        You are a precise video scene boundary detector for video editing. Analyze the video and identify the most important scenes. A scene should represent a semantic unit (change in location, time of day, topic, or camera setup), not frame-by-frame changes or tiny motion; ignore flashes, micro-cuts, or edits shorter than a couple of seconds.
-        
-        Guidelines for scene selection:
-        - Aim for approximately {target_scene_count} scenes.
-        - If the video is high-action, you may go slightly over. If it is a slow-paced lecture, you may go slightly under.
-        - Focus on visual transitions, key speaking points, or high-energy moments.
-        - Each scene must be between 2 and 10 seconds long.
+        ACT AS: A Lead Film Editor.
+        TASK: Perform semantic scene segmentation to identify the primary narrative "chapters" of this video.
 
-        IMPORTANT: All timestamps must be in TOTAL SECONDS only. 
-        - 1 minute 15 seconds must be 75.0
-        - 2 minutes must be 120.0
-        Do NOT use decimal minutes like 1.15 or 2.00.
+        CORE OBJECTIVE:
+        Identify the most important semantic units, aiming for a maximum of {target_scene_count} scenes. 
+        If the video has fewer than {target_scene_count} meaningful narrative shifts, return only the scenes that are truly distinct. Quality and semantic unity are more important than hitting the target count.
+
+        SCENE DEFINITION (The "Unit"):
+        A scene is a continuous story beat or conceptual chapter. Do NOT split a scene just because of:
+        - Internal edits: Jump cuts or camera angle changes within the same location/topic.
+        - B-roll: Cutaway footage that supports the current speaker or primary action.
+        - Minor motion: The subject or camera moving within the same environment.
+
+        ONLY mark a new scene boundary when there is a:
+        1. "Hard Transition": A change in physical location or a significant jump in time.
+        2. "Topic Shift": A clear transition to a new subject, talking point, or narrative beat.
+        3. "Visual Reset": A radical change in environment, a title card, or a fade-to-black.
+
+        CONSTRAINTS:
+        - BUDGET: Up to {target_scene_count} scenes. Fewer is perfectly acceptable if the video is simple or short.
+        - MINIMUM DURATION: Every scene MUST be at least 2.0 seconds long.
+        - TIMESTAMP FORMAT: Total cumulative seconds (e.g., 125.5). NO decimal minutes.
         """
         
         # 3. Requesting the content with Structured Config
         response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
+            model="gemini-3-pro-preview",
             contents=[file_info, prompt],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=response_schema,
-                temperature=0.1, # Lower temperature = higher consistency
+                temperature=0.0, # Lower temperature = higher consistency
+                # thinking_level="low",
                 max_output_tokens=8192, # Maximum possible to prevent truncation
                 safety_settings=[
                     types.SafetySetting(
