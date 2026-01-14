@@ -10,11 +10,10 @@ from typing import Dict, Any, List
 
 import modal
 
-# 1. SHARED STORAGE & APP CONFIG
 # Volume for shared high-res videos between coordinator and parallel workers
 video_storage = modal.Volume.from_name("high-res-videos", create_if_missing=True)
 
-# A persistent dictionary for tracking cross-container job status
+# Persistent dictionary for tracking cross-container job status
 progress_tracker = modal.Dict.from_name("clipping-progress", create_if_missing=True)
 
 app = modal.App("clip-video")
@@ -36,13 +35,13 @@ image = (
     .add_local_file(".env.vault", "/root/.env.vault", copy=True)
 )
 
-# Install kaiber-utils from repo
+# Install kaiber-utils from github repo
 image = image.run_commands(
     "pip install git+https://$GITHUB_TOKEN@github.com/KaiberAI/kaiber-utils.git",
     secrets=[modal.Secret.from_name("kaiber-secrets")],
 )
 
-# 2. FAN-OUT WORKER: Cut and Upload to R2
+# FAN-OUT WORKER: Cut and Upload to R2
 @app.function(
     image=image, 
     volumes={"/videos": video_storage},
@@ -97,7 +96,7 @@ def cut_and_upload_clip(scene: Dict[str, Any], input_path: str, width: int, heig
     # Upload to R2
     s3.upload_file(local_output_path, R2_BUCKET_NAME, key)
 
-    # Generate Presigned URL (Valid for 24 hours) - DEBUG only
+    # Generate Presigned URL (Valid for 24 hours) - UNUSED
     presigned_url = s3.generate_presigned_url(
         "get_object",
         Params={"Bucket": R2_BUCKET_NAME, "Key": key},
@@ -117,7 +116,7 @@ def cut_and_upload_clip(scene: Dict[str, Any], input_path: str, width: int, heig
         "height": height
     }
 
-# 3. TRACK B HELPER: High-Res Download
+# TRACK B HELPER: High-Res Download
 async def download_high_res_video(url: str, output_path: str):
     import yt_dlp
     ydl_opts = {
@@ -132,7 +131,7 @@ async def download_high_res_video(url: str, output_path: str):
     
     await asyncio.to_thread(download)
 
-# 5. COORDINATOR: Track A (Gemini) + Parallel Fan-out Orchestration
+# COORDINATOR: Track A (Gemini) + Parallel Fan-out Orchestration
 @app.function(
     image=image,
     secrets=[modal.Secret.from_name("kaiber-secrets")],
@@ -156,7 +155,7 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
 
         progress_tracker[job_id] = 0.2
         
-        # 1. FFmpeg 1 FPS Stream logic
+        # FFmpeg 1 FPS Stream logic
         ffmpeg_cmd = [
             "ffmpeg", "-i", url,
             "-vf", "scale=1280:-2,fps=1", 
@@ -187,8 +186,7 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
 
         progress_tracker[job_id] = 0.45
         
-        # 2. Define the Schema for Structured Output
-        # This mathematically guarantees valid JSON and correct key names
+        # Define the response schema for Gemini
         response_schema = {
             "type": "OBJECT",
             "properties": {
@@ -239,7 +237,7 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
         - TIMESTAMP FORMAT: Total cumulative seconds (e.g., 125.5). NO decimal minutes.
         """
         
-        # 3. Requesting the content with Structured Config
+        # Gemini inference
         response = client.models.generate_content(
             model="gemini-3-pro-preview",
             contents=[file_info, prompt],
@@ -247,7 +245,7 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
                 response_mime_type="application/json",
                 response_schema=response_schema,
                 temperature=0.0, # Lower temperature = higher consistency
-                # thinking_level="low",
+                thinking_config=types.ThinkingConfig(thinking_level="low"),
                 max_output_tokens=8192, # Maximum possible to prevent truncation
                 safety_settings=[
                     types.SafetySetting(
@@ -272,7 +270,7 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
 
         progress_tracker[job_id] = 0.5
         
-        # 4. Cleanup and Parsing
+        # Cleanup and Parsing
         try:
             # Check for parsed object first
             if hasattr(response, 'parsed') and response.parsed is not None:
@@ -294,7 +292,6 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
 
     try:
         # EXECUTE TRACKS A & B IN PARALLEL
-        # This is where we save the 60-90 seconds of download latency
         _, timestamps = await asyncio.gather(
             download_high_res_video(url, high_res_path),
             perform_gemini_analysis(target_scene_count)
@@ -306,7 +303,7 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
             if (float(ts.get("end_time", 0)) - float(ts.get("start_time", 0))) >= 2.0
         ]
     
-        # 5. TRIGGER FAN-OUT
+        # Trigger Fan-out
         total_scenes = len(timestamps)
         if total_scenes == 0:
             progress_tracker[job_id] = 1.0
@@ -350,7 +347,7 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
         if job_id in progress_tracker:
             del progress_tracker[job_id]
 
-# 7. WEB INTERFACE
+# WEB INTERFACE
 @app.function(image=image)
 @modal.asgi_app()
 def fastapi_app():
@@ -381,7 +378,7 @@ def fastapi_app():
 
     @web_app.get("/status/{job_id}")
     async def get_status(job_id: str):
-        print(f"--- Polling status for Job ID: {job_id} ---") # Standard stdout log
+        print(f"--- Polling status for Job ID: {job_id} ---")
         try:
             call = modal.functions.FunctionCall.from_id(job_id)
             
@@ -389,8 +386,6 @@ def fastapi_app():
                 # Poll result (timeout=0 does not block)
                 result = call.get(timeout=0)
                 
-                # LOG THE RAW RESULT
-                # This helps you see if Gemini/Workers returned what you expected
                 print(f"SUCCESS: Job {job_id} finished. Result count: {len(result) if result else 0}")
                 logger.info(f"Raw Modal Result: {json.dumps(result, indent=2)}")
 
@@ -408,7 +403,6 @@ def fastapi_app():
                     "progress": 1.0
                 }
                 
-                # LOG THE FINAL MAPPED RESPONSE
                 print(f"Final Response sent to client: {len(response_data['scenes'])} scenes")
                 return response_data
 
@@ -418,7 +412,6 @@ def fastapi_app():
                 return {"status": "processing", "progress": progress}
                 
         except Exception as e:
-            # LOG THE ERROR
             print(f"ERROR: Job {job_id} failed with exception: {str(e)}")
             logger.error(f"Stack trace for {job_id}:", exc_info=True)
             return {
