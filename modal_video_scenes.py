@@ -13,6 +13,10 @@ import modal
 # 1. SHARED STORAGE & APP CONFIG
 # Volume for shared high-res videos between coordinator and parallel workers
 video_storage = modal.Volume.from_name("high-res-videos", create_if_missing=True)
+
+# A persistent dictionary for tracking cross-container job status
+progress_tracker = modal.Dict.from_name("clipping-progress", create_if_missing=True)
+
 app = modal.App("clip-video")
 
 # Image containing all required binaries and libraries
@@ -136,6 +140,9 @@ async def download_high_res_video(url: str, output_path: str):
     timeout=3600,
 )
 async def process_video_with_gemini(url: str, width: int, height: int, target_scene_count: int) -> List[Dict[str, Any]]:
+    job_id = modal.current_function_call_id()
+    current_progress = progress_tracker.get(job_id, 0.05)
+    
     from google import genai
     from google.genai import types
     from env_vars import config
@@ -172,6 +179,8 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
             file_info = client.files.get(name=video_file.name)
             if file_info.state.name == "ACTIVE": break
             await asyncio.sleep(2)
+
+        progress_tracker[job_id] = 0.25
         
         # 2. Define the Schema for Structured Output
         # This mathematically guarantees valid JSON and correct key names
@@ -291,9 +300,17 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
         ]
     
         # 5. TRIGGER FAN-OUT
-        print(f"Analysis complete. Clipping {len(timestamps)} scenes in parallel...")
+        total_scenes = len(timestamps)
+        if total_scenes == 0:
+            progress_tracker[job_id] = 1.0
+            return []
+
+        print(f"Analysis complete. Clipping {total_scenes} scenes in parallel...")
+        current_progress = progress_tracker.get(job_id, 0.05)
         # map() handles massive scale automatically
         final_clips = []
+        completed_count = 0
+
         async for clip in cut_and_upload_clip.map.aio(
             timestamps, 
             kwargs={"input_path": high_res_path, "width": width, "height": height},
@@ -303,6 +320,13 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
             if isinstance(clip, Exception):
                 print(f"⚠️ Scene failed: {type(clip).__name__} - {clip}")
                 continue
+
+            completed_count += 1
+            # Calculate granular progress for the 0.5 to 1.0 range
+            percent_of_fanout = completed_count / total_scenes
+            current_val = round(0.5 + (percent_of_fanout * 0.5), 2)
+            progress_tracker[job_id] = current_val
+
             final_clips.append(clip)
         
         # Cleanup original high-res video from Volume
@@ -315,6 +339,10 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
     except Exception as e:
         print(f"Pipeline Error: {e}")
         raise
+
+    finally:
+        if job_id in progress_tracker:
+            del progress_tracker[job_id]
 
 # 7. WEB INTERFACE
 @app.function(image=image)
@@ -348,7 +376,6 @@ def fastapi_app():
     @web_app.get("/status/{job_id}")
     async def get_status(job_id: str):
         print(f"--- Polling status for Job ID: {job_id} ---") # Standard stdout log
-        
         try:
             call = modal.functions.FunctionCall.from_id(job_id)
             
@@ -372,7 +399,7 @@ def fastapi_app():
                             "url": s.get("url")
                         } for i, s in enumerate(result)
                     ],
-                    "progress": 100
+                    "progress": 1.0
                 }
                 
                 # LOG THE FINAL MAPPED RESPONSE
@@ -381,7 +408,8 @@ def fastapi_app():
 
             except TimeoutError:
                 print(f"STILL PROCESSING: Job {job_id} is not yet finished.")
-                return {"status": "processing", "progress": 50}
+                progress = progress_tracker.get(job_id, 0.05)
+                return {"status": "processing", "progress": progress}
                 
         except Exception as e:
             # LOG THE ERROR
