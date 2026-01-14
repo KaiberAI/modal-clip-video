@@ -146,14 +146,15 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
     from google import genai
     from google.genai import types
     from env_vars import config
-    GOOGLE_GEMINI_API_KEY = config.GOOGLE_GEMINI_API_KEY
 
-    client = genai.Client(api_key=GOOGLE_GEMINI_API_KEY)
+    client = genai.Client(api_key=config.GOOGLE_GEMINI_API_KEY)
     video_id = str(uuid.uuid4())
     high_res_path = f"/videos/{video_id}.mp4"
 
     async def perform_gemini_analysis(target_scene_count: int):
         from google.genai import types
+
+        progress_tracker[job_id] = 0.2
         
         # 1. FFmpeg 1 FPS Stream logic
         ffmpeg_cmd = [
@@ -169,18 +170,22 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
             *ffmpeg_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
         stdout_data, _ = await process.communicate()
+
+        progress_tracker[job_id] = 0.3
         
         video_file = client.files.upload(
             file=io.BytesIO(stdout_data),
             config=types.UploadFileConfig(mime_type="video/mp4")
         )
+
+        progress_tracker[job_id] = 0.35
         
         while True:
             file_info = client.files.get(name=video_file.name)
             if file_info.state.name == "ACTIVE": break
             await asyncio.sleep(2)
 
-        progress_tracker[job_id] = 0.25
+        progress_tracker[job_id] = 0.45
         
         # 2. Define the Schema for Structured Output
         # This mathematically guarantees valid JSON and correct key names
@@ -264,6 +269,8 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
                 ]
             )
         )
+
+        progress_tracker[job_id] = 0.5
         
         # 4. Cleanup and Parsing
         try:
