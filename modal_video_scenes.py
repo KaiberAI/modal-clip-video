@@ -141,7 +141,7 @@ async def download_high_res_video(url: str, output_path: str):
 )
 async def process_video_with_gemini(url: str, width: int, height: int, target_scene_count: int) -> List[Dict[str, Any]]:
     job_id = modal.current_function_call_id()
-    current_progress = progress_tracker.get(job_id, 0.05)
+    progress_tracker[job_id] = 0.1
     
     from google import genai
     from google.genai import types
@@ -306,7 +306,6 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
             return []
 
         print(f"Analysis complete. Clipping {total_scenes} scenes in parallel...")
-        current_progress = progress_tracker.get(job_id, 0.05)
         # map() handles massive scale automatically
         final_clips = []
         completed_count = 0
@@ -408,7 +407,7 @@ def fastapi_app():
 
             except TimeoutError:
                 print(f"STILL PROCESSING: Job {job_id} is not yet finished.")
-                progress = progress_tracker.get(job_id, 0.05)
+                progress = progress_tracker.get(job_id, 0.1)
                 return {"status": "processing", "progress": progress}
                 
         except Exception as e:
