@@ -41,6 +41,19 @@ image = image.run_commands(
     secrets=[modal.Secret.from_name("kaiber-secrets")],
 )
 
+def get_video_duration(path: str) -> float:
+    import subprocess
+    try:
+        cmd = [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return float(result.stdout.strip())
+    except Exception as e:
+        print(f"Error probing video duration: {e}")
+        return 0.0
+
 # FAN-OUT WORKER: Cut and Upload to R2
 @app.function(
     image=image, 
@@ -50,7 +63,7 @@ image = image.run_commands(
     retries=2,
     timeout=300
 )
-def cut_and_upload_clip(scene: Dict[str, Any], input_path: str, width: int, height: int) -> Dict[str, Any]:
+def cut_and_upload_clip(scene: Dict[str, Any], input_path: str) -> Dict[str, Any]:
     """Runs in parallel for every scene: Clips via FFmpeg and uploads to R2."""
     import subprocess
     import boto3
@@ -62,6 +75,9 @@ def cut_and_upload_clip(scene: Dict[str, Any], input_path: str, width: int, heig
     R2_SECRET_ACCESS_KEY = config.R2_SECRET_ACCESS_KEY
     R2_BUCKET_NAME = config.R2_BUCKET_NAME
 
+    width = scene.get("width")
+    height = scene.get("height")
+
     # Generate unique hash for filename
     file_hash = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
     clip_filename = f"{file_hash}.mp4"
@@ -70,12 +86,16 @@ def cut_and_upload_clip(scene: Dict[str, Any], input_path: str, width: int, heig
     
     # Fast Seek (-ss before -i) + Stream Copy (-c copy)
     duration = scene["end_time"] - scene["start_time"]
+
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(scene["start_time"]), 
         "-i", input_path,
         "-t", str(duration),
-        "-c", "copy",
+        "-c:v", "libx264",        # Use H.264 video codec
+        "-preset", "ultrafast",   # Keep it fast
+        "-crf", "23",             # Good balance of quality/size
+        "-c:a", "aac",            # Ensure audio is compatible
         "-map_metadata", "0",
         "-movflags", "+faststart",
         local_output_path
@@ -113,7 +133,8 @@ def cut_and_upload_clip(scene: Dict[str, Any], input_path: str, width: int, heig
         "filename": clip_filename,
         "key": key,
         "width": width,
-        "height": height
+        "height": height,
+        "length": round(duration, 2),
     }
 
 # TRACK B HELPER: High-Res Download
@@ -192,7 +213,7 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
             "properties": {
                 "scenes": {
                     "type": "ARRAY",
-                    "maxItems": target_scene_count,  # Enforce a maximum number of scenes
+                    "maxItems": 50,  # Enforce a maximum number of scenes
                     "items": {
                         "type": "OBJECT",
                         "properties": {
@@ -213,26 +234,24 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
         }
 
         prompt = f"""
-        ACT AS: A Lead Film Editor.
-        TASK: Perform semantic scene segmentation to identify the primary narrative "chapters" of this video.
+        ACT AS: A Technical Video Editor.
+        TASK: Shot-Based Scene Detection.
 
         CORE OBJECTIVE:
-        Identify the most important semantic units, aiming for a maximum of {target_scene_count} scenes. 
-        If the video has fewer than {target_scene_count} meaningful narrative shifts, return only the scenes that are truly distinct. Quality and semantic unity are more important than hitting the target count.
+        Partition this video into distinct visual units. Do NOT aim for a specific number of scenes or a specific duration. Let the visual changes of the video dictate the segments.
 
-        SCENE DEFINITION (The "Unit"):
-        A scene is a continuous story beat or conceptual chapter. Do NOT split a scene just because of:
-        - Internal edits: Jump cuts or camera angle changes within the same location/topic.
-        - B-roll: Cutaway footage that supports the current speaker or primary action.
-        - Minor motion: The subject or camera moving within the same environment.
+        SCENE DETECTION LOGIC (Trigger a new scene ONLY when):
+        1. "Physical Cut": An instantaneous jump from one camera angle to another.
+        2. "Environment Swap": A complete change in the background or setting.
+        3. "B-Roll Insertion": A cut away from the main subject to supporting footage.
+        4. "Visual Reset": A transition to a full-screen graphic, title card, or black frame.
 
-        ONLY mark a new scene boundary when there is a:
-        1. "Hard Transition": A change in physical location or a significant jump in time.
-        2. "Topic Shift": A clear transition to a new subject, talking point, or narrative beat.
-        3. "Visual Reset": A radical change in environment, a title card, or a fade-to-black.
+        HANDLING VARIABLE LENGTHS:
+        - If the camera stays on one subject for 5 minutes without cutting, return ONE 5-minute scene.
+        - If there are 10 rapid cuts in 10 seconds, return 10 short scenes.
+        - Respect the editor's original intent: every "hard cut" is a new boundary.
 
         CONSTRAINTS:
-        - BUDGET: Up to {target_scene_count} scenes. Fewer is perfectly acceptable if the video is simple or short.
         - MINIMUM DURATION: Every scene MUST be at least 2.0 seconds long.
         - TIMESTAMP FORMAT: Total cumulative seconds (e.g., 125.5). NO decimal minutes.
         """
@@ -274,6 +293,7 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
         try:
             # Check for parsed object first
             if hasattr(response, 'parsed') and response.parsed is not None:
+                print(f"Gemini response: {response.parsed}")
                 raw_data = response.parsed
                 timestamps = raw_data.get("scenes", []) if isinstance(raw_data, dict) else getattr(raw_data, "scenes", [])
             else:
@@ -297,14 +317,35 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
             perform_gemini_analysis(target_scene_count)
         )
 
-        # Filter out clips shorter than 2 seconds (and and invalid timestamps)
-        timestamps = [
-            ts for ts in timestamps 
-            if (float(ts.get("end_time", 0)) - float(ts.get("start_time", 0))) >= 2.0
-        ]
+        actual_duration = get_video_duration(high_res_path)
+
+        # Filter/validate timestamps
+        valid_timestamps = []
+        for ts in timestamps:
+            start = float(ts.get("start_time", 0))
+            end = float(ts.get("end_time", 0))
+            
+            # Scene starts after the video actually ends (FAIL)
+            if start >= actual_duration:
+                print(f"Skipping ghost scene: {start} is beyond duration {actual_duration}")
+                continue
+                
+            # Scene ends after the video ends (CLAMP)
+            if end > actual_duration:
+                ts["end_time"] = actual_duration
+            
+            # Filter clips shorter than 2 seconds
+            if (float(ts["end_time"]) - float(ts["start_time"])) >= 2.0:
+                valid_timestamps.append(ts)
+
+            ts["width"] = width
+            ts["height"] = height
+
+        if not valid_timestamps:
+            raise ValueError(f"No valid scenes found.")
     
         # Trigger Fan-out
-        total_scenes = len(timestamps)
+        total_scenes = len(valid_timestamps)
         if total_scenes == 0:
             progress_tracker[job_id] = 1.0
             return []
@@ -315,8 +356,8 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
         completed_count = 0
 
         async for clip in cut_and_upload_clip.map.aio(
-            timestamps, 
-            kwargs={"input_path": high_res_path, "width": width, "height": height},
+            valid_timestamps, 
+            kwargs={"input_path": high_res_path},
             return_exceptions=True,            # Don't crash the whole job
             wrap_returned_exceptions=False     # Return the raw error
         ):
@@ -337,6 +378,9 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
             os.remove(high_res_path)
             video_storage.commit()
 
+        # Sort clips by start_time (map.aio returns in completion order)
+        final_clips.sort(key=lambda x: float(x.get("start_time", 0)))
+
         return final_clips
 
     except Exception as e:
@@ -354,13 +398,8 @@ def fastapi_app():
     from fastapi import FastAPI
     from pydantic import BaseModel
     import modal.functions
-    import logging
     import json
     import asyncio
-
-    # Set up logging to show in Modal console
-    logger = logging.getLogger("status-logger")
-    logger.setLevel(logging.INFO)
     
     web_app = FastAPI(title="Beat Sync Video Clipping Worker")
 
@@ -374,7 +413,7 @@ def fastapi_app():
     async def start_job(data: StartRequest):
         # Spawn the job and get the call_id
         job = process_video_with_gemini.spawn(data.url, data.width, data.height, data.target_scene_count)
-        return {"job_id": job.object_id, "status": "processing"}
+        return {"job_id": job.object_id}
 
     @web_app.get("/status/{job_id}")
     async def get_status(job_id: str):
@@ -386,15 +425,12 @@ def fastapi_app():
                 # Poll result (timeout=0 does not block)
                 result = call.get(timeout=0)
                 
-                print(f"SUCCESS: Job {job_id} finished. Result count: {len(result) if result else 0}")
-                logger.info(f"Raw Modal Result: {json.dumps(result, indent=2)}")
-
                 response_data = {
                     "status": "completed",
                     "scenes": [
                         {
                             "key": s.get("key"),
-                            "length": round(float(s.get("end_time", 0)) - float(s.get("start_time", 0)), 2),
+                            "length": s.get("length"),
                             "width": s.get("width"),
                             "height": s.get("height"),
                             "url": s.get("url")
@@ -403,7 +439,8 @@ def fastapi_app():
                     "progress": 1.0
                 }
                 
-                print(f"Final Response sent to client: {len(response_data['scenes'])} scenes")
+                print(f"SUCCESS: Job {job_id} finished. Result count: {len(result) if result else 0}")
+                print(f"response_data: {response_data}")
                 return response_data
 
             except TimeoutError:
@@ -413,7 +450,7 @@ def fastapi_app():
                 
         except Exception as e:
             print(f"ERROR: Job {job_id} failed with exception: {str(e)}")
-            logger.error(f"Stack trace for {job_id}:", exc_info=True)
+            print.error(f"Stack trace for {job_id}:", exc_info=True)
             return {
                 "status": "failed", 
                 "error": str(e)
