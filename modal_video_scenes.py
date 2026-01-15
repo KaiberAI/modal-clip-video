@@ -213,8 +213,8 @@ async def process_video_with_gemini(url: str, width: int, height: int) -> List[D
             "properties": {
                 "scenes": {
                     "type": "ARRAY",
-                    # "minItems": 1,
-                    # "maxItems": 50,
+                    "minItems": 1,
+                    "maxItems": 50,
                     "items": {
                         "type": "OBJECT",
                         "properties": {
@@ -257,7 +257,7 @@ async def process_video_with_gemini(url: str, width: int, height: int) -> List[D
         
         # Gemini inference
         response = client.models.generate_content(
-            model="gemini-3-pro-preview",
+            model="gemini-3-flash-preview",
             contents=[file_info, prompt],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -327,7 +327,6 @@ async def process_video_with_gemini(url: str, width: int, height: int) -> List[D
         for ts in timestamps:
             start = float(ts.get("start_time", 0)) + TRIM_START
             end = float(ts.get("end_time", 0)) - TRIM_END
-            duration = end - start
             
             # Scene starts after the video actually ends (FAIL)
             if start >= actual_duration:
@@ -337,15 +336,18 @@ async def process_video_with_gemini(url: str, width: int, height: int) -> List[D
             # Scene ends after the video ends (CLAMP)
             if end > actual_duration:
                 ts["end_time"] = actual_duration
+
+            duration = end - start
             
             # Filter clips shorter than 2 seconds
             if duration >= MIN_RESULT_DURATION:
+                ts.update({
+                    "start_time": start,
+                    "end_time": end,
+                    "width": width,
+                    "height": height
+                })
                 valid_timestamps.append(ts)
-
-            ts["start_time"] = start
-            ts["end_time"] = end
-            ts["width"] = width
-            ts["height"] = height
 
         if not valid_timestamps:
             raise ValueError(f"No valid scenes found.")
