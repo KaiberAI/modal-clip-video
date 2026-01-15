@@ -89,9 +89,9 @@ def cut_and_upload_clip(scene: Dict[str, Any], input_path: str) -> Dict[str, Any
 
     cmd = [
         "ffmpeg", "-y",
-        "-ss", str(scene["start_time"]), 
         "-i", input_path,
-        "-t", str(duration),
+        "-ss", str(scene["start_time"]), 
+        "-t", str(max(0.5, duration - 0.1)), # Duration with 0.1s safety buffer
         "-c:v", "libx264",        # Use H.264 video codec
         "-preset", "ultrafast",   # Keep it fast
         "-crf", "23",             # Good balance of quality/size
@@ -159,7 +159,7 @@ async def download_high_res_video(url: str, output_path: str):
     volumes={"/videos": video_storage},
     timeout=3600,
 )
-async def process_video_with_gemini(url: str, width: int, height: int, target_scene_count: int) -> List[Dict[str, Any]]:
+async def process_video_with_gemini(url: str, width: int, height: int) -> List[Dict[str, Any]]:
     job_id = modal.current_function_call_id()
     progress_tracker[job_id] = 0.1
     
@@ -171,7 +171,7 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
     video_id = str(uuid.uuid4())
     high_res_path = f"/videos/{video_id}.mp4"
 
-    async def perform_gemini_analysis(target_scene_count: int):
+    async def perform_gemini_analysis():
         from google.genai import types
 
         progress_tracker[job_id] = 0.2
@@ -213,6 +213,7 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
             "properties": {
                 "scenes": {
                     "type": "ARRAY",
+                    "minItems": 1,
                     "maxItems": 50,  # Enforce a maximum number of scenes
                     "items": {
                         "type": "OBJECT",
@@ -225,6 +226,10 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
                                 "type": "NUMBER", 
                                 "description": "End time in CUMULATIVE SECONDS. Must be greater than start_time."
                             },
+                            "description": {
+                                "type": "STRING", 
+                                "description": "Briefly explain WHY this is a new scene (e.g., 'Cut to close-up', 'Location change')."
+                            }
                         },
                         "required": ["start_time", "end_time"]
                     }
@@ -240,19 +245,13 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
         CORE OBJECTIVE:
         Partition this video into distinct visual units. Do NOT aim for a specific number of scenes or a specific duration. Let the visual changes of the video dictate the segments.
 
-        SCENE DETECTION LOGIC (Trigger a new scene ONLY when):
-        1. "Physical Cut": An instantaneous jump from one camera angle to another.
-        2. "Environment Swap": A complete change in the background or setting.
-        3. "B-Roll Insertion": A cut away from the main subject to supporting footage.
-        4. "Visual Reset": A transition to a full-screen graphic, title card, or black frame.
-
-        HANDLING VARIABLE LENGTHS:
-        - If the camera stays on one subject for 5 minutes without cutting, return ONE 5-minute scene.
-        - If there are 10 rapid cuts in 10 seconds, return 10 short scenes.
-        - Respect the editor's original intent: every "hard cut" is a new boundary.
+        HOW TO DETECT SCENES:
+        Divide the video based on Visual and Narrative Discontinuity.
+        1. High-Density Rule: If there are rapid-fire cuts, capture each unique camera angle as a scene.
+        2. Low-Density Rule: If the camera is static or following a single subject without cutting, do NOT split it, regardless of how long the video is.
+        3. The 'Significant Change' Test: A new scene is defined by a change in Subject, Location, or Camera Perspective. If none of these three change, it is the same scene.
 
         CONSTRAINTS:
-        - MINIMUM DURATION: Every scene MUST be at least 2.0 seconds long.
         - TIMESTAMP FORMAT: Total cumulative seconds (e.g., 125.5). NO decimal minutes.
         """
         
@@ -314,7 +313,7 @@ async def process_video_with_gemini(url: str, width: int, height: int, target_sc
         # EXECUTE TRACKS A & B IN PARALLEL
         _, timestamps = await asyncio.gather(
             download_high_res_video(url, high_res_path),
-            perform_gemini_analysis(target_scene_count)
+            perform_gemini_analysis()
         )
 
         actual_duration = get_video_duration(high_res_path)
@@ -407,12 +406,11 @@ def fastapi_app():
         url: str
         width: int
         height: int
-        target_scene_count: int
 
     @web_app.post("/start")
     async def start_job(data: StartRequest):
         # Spawn the job and get the call_id
-        job = process_video_with_gemini.spawn(data.url, data.width, data.height, data.target_scene_count)
+        job = process_video_with_gemini.spawn(data.url, data.width, data.height)
         return {"job_id": job.object_id}
 
     @web_app.get("/status/{job_id}")
