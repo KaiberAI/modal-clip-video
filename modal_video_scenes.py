@@ -90,8 +90,8 @@ def cut_and_upload_clip(scene: Dict[str, Any], input_path: str) -> Dict[str, Any
     cmd = [
         "ffmpeg", "-y",
         "-i", input_path,
-        "-ss", str(scene["start_time"]), 
-        "-t", str(max(0.5, duration - 0.1)), # Duration with 0.1s safety buffer
+        "-ss", str(scene["start_time"]),
+        "-to", str(scene["end_time"]),
         "-c:v", "libx264",        # Use H.264 video codec
         "-preset", "ultrafast",   # Keep it fast
         "-crf", "23",             # Good balance of quality/size
@@ -213,8 +213,8 @@ async def process_video_with_gemini(url: str, width: int, height: int) -> List[D
             "properties": {
                 "scenes": {
                     "type": "ARRAY",
-                    "minItems": 1,
-                    "maxItems": 50,  # Enforce a maximum number of scenes
+                    # "minItems": 1,
+                    # "maxItems": 50,
                     "items": {
                         "type": "OBJECT",
                         "properties": {
@@ -263,7 +263,7 @@ async def process_video_with_gemini(url: str, width: int, height: int) -> List[D
                 response_mime_type="application/json",
                 response_schema=response_schema,
                 temperature=0.0, # Lower temperature = higher consistency
-                thinking_config=types.ThinkingConfig(thinking_level="low"),
+                thinking_config=types.ThinkingConfig(thinking_level="high"),
                 max_output_tokens=8192, # Maximum possible to prevent truncation
                 safety_settings=[
                     types.SafetySetting(
@@ -320,9 +320,14 @@ async def process_video_with_gemini(url: str, width: int, height: int) -> List[D
 
         # Filter/validate timestamps
         valid_timestamps = []
+        TRIM_START = 0.2
+        TRIM_END = 0.5
+        MIN_RESULT_DURATION = 2.0
+
         for ts in timestamps:
-            start = float(ts.get("start_time", 0))
-            end = float(ts.get("end_time", 0))
+            start = float(ts.get("start_time", 0)) + TRIM_START
+            end = float(ts.get("end_time", 0)) - TRIM_END
+            duration = end - start
             
             # Scene starts after the video actually ends (FAIL)
             if start >= actual_duration:
@@ -334,9 +339,11 @@ async def process_video_with_gemini(url: str, width: int, height: int) -> List[D
                 ts["end_time"] = actual_duration
             
             # Filter clips shorter than 2 seconds
-            if (float(ts["end_time"]) - float(ts["start_time"])) >= 2.0:
+            if duration >= MIN_RESULT_DURATION:
                 valid_timestamps.append(ts)
 
+            ts["start_time"] = start
+            ts["end_time"] = end
             ts["width"] = width
             ts["height"] = height
 
