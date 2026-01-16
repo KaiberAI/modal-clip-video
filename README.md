@@ -26,28 +26,30 @@ Content-Type: application/json
 **Request Body:**
 ```json
 {
-  "url": "https://example.com/video.mp4"
+  "url": "https://example.com/video.mp4",
+  "width": 1280,
+  "height": 720
 }
 ```
 
 **Request Schema:**
-| Field | Type   | Required | Description                    |
-|-------|--------|----------|--------------------------------|
-| `url` | string | Yes      | The URL of the video to clip   |
+| Field   | Type   | Required | Description                          |
+|---------|--------|----------|--------------------------------------|
+| `url`   | string | Yes      | The URL of the video to clip         |
+| `width` | number | Yes      | Video width in pixels                |
+| `height`| number | Yes      | Video height in pixels               |
 
 **Response (Success - 200 OK):**
 ```json
 {
-  "job_id": "uuid-string",
-  "start_time": "2024-01-08T12:00:00.000Z"
+  "job_id": "uuid-string"
 }
 ```
 
 **Response Schema:**
-| Field        | Type   | Required | Description                                      |
-|--------------|--------|----------|--------------------------------------------------|
-| `job_id`     | string | Yes      | Unique identifier for the clipping job           |
-| `start_time` | string | No       | ISO 8601 timestamp when the job started          |
+| Field    | Type   | Required | Description                        |
+|----------|--------|----------|------------------------------------|
+| `job_id` | string | Yes      | Unique identifier for the clipping job |
 
 **Error Response:**
 - Returns non-200 status code on failure
@@ -75,17 +77,15 @@ Content-Type: application/json
 ```json
 {
   "status": "processing",
-  "progress": 45,
-  "created_at": "2024-01-08T12:00:00.000Z"
+  "progress": 0.45
 }
 ```
 
 **Response Schema (Processing):**
-| Field        | Type   | Required | Description                                   |
-|--------------|--------|----------|-----------------------------------------------|
-| `status`     | string | Yes      | Must be "processing" or "queued"              |
-| `progress`   | number | No       | Progress percentage (0-100), defaults to 0    |
-| `created_at` | string | No       | ISO 8601 timestamp when job was created       |
+| Field      | Type   | Required | Description                                    |
+|------------|--------|----------|------------------------------------------------|
+| `status`   | string | Yes      | Must be "processing" or "queued"               |
+| `progress` | number | No       | Progress value (0.0-1.0), defaults to 0.1      |
 
 ---
 
@@ -98,16 +98,18 @@ Content-Type: application/json
       "key": "user-videos/temp/hash1.mp4",
       "length": 5.5,
       "width": 1280,
-      "height": 720
+      "height": 720,
+      "url": "https://..."
     },
     {
       "key": "user-videos/temp/hash2.mp4",
       "length": 3.2,
       "width": 1280,
-      "height": 720
+      "height": 720,
+      "url": "https://..."
     }
   ],
-  "progress": 100
+  "progress": 1.0
 }
 ```
 
@@ -116,15 +118,16 @@ Content-Type: application/json
 |------------|--------|----------|----------------------------------------------|
 | `status`   | string | Yes      | Must be "completed"                          |
 | `scenes`   | array  | Yes      | Array of clipped video scenes (can be empty) |
-| `progress` | number | No       | Progress percentage (100 for completed)      |
+| `progress` | number | No       | Progress value (1.0 for completed)           |
 
 **Scene Object Schema:**
-| Field      | Type   | Required | Description                 |
-|------------|--------|----------|-----------------------------|
-| `key`      | string | No       | R2 storage key for the clip |
-| `length`   | number | No       | Duration of clip in seconds |
-| `width`    | number | No       | Video width in pixels       |
-| `height`   | number | No       | Video height in pixels      |
+| Field      | Type   | Required | Description                                      |
+|------------|--------|----------|--------------------------------------------------|
+| `key`      | string | No       | R2 storage key for the clip                      |
+| `length`   | number | No       | Duration of clip in seconds                      |
+| `width`    | number | No       | Video width in pixels                            |
+| `height`   | number | No       | Video height in pixels                           |
+| `url`      | string | No       | Presigned R2 URL (valid for 24 hours)            |
 
 ---
 
@@ -146,9 +149,9 @@ Content-Type: application/json
 
 ## Status Flow
 
-1. **Job Created** → Status: `"processing"`
-2. **Job In Progress** → Status: `"processing"` with `progress` (e.g., 50)
-3. **Job Complete** → Status: `"completed"` with `scenes` array and `progress: 100`
+1. **Job Created** → Status: `"processing"` with `progress: 0.1`
+2. **Job In Progress** → Status: `"processing"` with `progress` (0.0-1.0, e.g., 0.45)
+3. **Job Complete** → Status: `"completed"` with `scenes` array and `progress: 1.0`
 4. **Job Failed** → Status: `"failed"` with `error` message
 
 ---
@@ -160,8 +163,8 @@ Content-Type: application/json
 The Kaiber server (`ClipVideoService.ts`) performs the following transformations:
 
 1. **On Start:**
-   - Sends `{ url: source }` to Modal `/start`
-   - Receives `{ job_id, start_time }` from Modal
+   - Sends `{ url: source, width: ..., height: ... }` to Modal `/start`
+   - Receives `{ job_id }` from Modal
    - Returns `{ jobId, createdAt }` to client
 
 2. **On Status Check:**
@@ -184,7 +187,6 @@ The Kaiber server (`ClipVideoService.ts`) performs the following transformations
 - Missing optional fields use sensible defaults:
   - `progress`: defaults to `0`
   - `error`: defaults to `"Unknown error"`
-  - `created_at`: defaults to current server time
 
 ---
 
@@ -193,38 +195,30 @@ The Kaiber server (`ClipVideoService.ts`) performs the following transformations
 ### Overview
 
 The Modal app now includes a `process_video_with_gemini` function that:
-1. Takes a video URL
-2. Transcodes it to 720p using FFmpeg
-3. Streams the video to Google's Gemini File API
-4. Polls until the file is ACTIVE
-5. Uses `gemini-2.0-flash-exp` to analyze the video and extract scene timestamps
-6. Returns structured JSON with scene boundaries and descriptions
+1. Takes a video URL, width, and height
+2. Streams the video at 1 FPS with scale 1280 using FFmpeg directly to Google's Gemini File API
+3. Downloads the high-resolution video in parallel for clipping
+4. Polls until the Gemini file is ACTIVE
+5. Uses `gemini-3-flash-preview` to analyze the video and extract scene timestamps
+6. Validates and filters scenes (minimum 2 seconds, trims 0.2s from start and 0.5s from end)
+7. Clips scenes in parallel using fan-out workers that upload to R2
+8. Returns structured JSON with scene boundaries, descriptions, and R2 URLs
 
 ### Direct Function Call
 
-You can call the Gemini processing function directly using Modal CLI:
-
-```bash
-modal run test_gemini_processing.py --video-url "https://example.com/video.mp4"
-```
-
-Or use the default Big Buck Bunny sample video:
-
-```bash
-modal run test_gemini_processing.py
-```
+You can call the Gemini processing function directly using Modal CLI (note: requires url, width, and height parameters):
 
 ### Using with /start Endpoint
 
 ```bash
 curl -X POST https://kaiber-ai--clip-video-fastapi-app.modal.run/start \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://example.com/video.mp4"}'
+  -d '{"url": "https://example.com/video.mp4", "width": 1280, "height": 720}'
 ```
 
 ### Output Format
 
-The Gemini processing function returns JSON with scene timestamps:
+The Gemini processing function returns JSON with scene data:
 
 ```json
 [
@@ -233,9 +227,11 @@ The Gemini processing function returns JSON with scene timestamps:
     "end_time": 5.5,
     "url": "https://...",
     "key": "user-videos/temp/hash.mp4",
+    "filename": "hash.mp4",
     "width": 1280,
     "height": 720,
-    "duration": 5.5
+    "length": 5.5,
+    "description": "Brief scene description"
   }
 ]
 ```
@@ -249,10 +245,13 @@ The Gemini processing function returns JSON with scene timestamps:
 ### Logs
 
 All processing steps are logged to Modal logs:
-- FFmpeg transcode progress
+- FFmpeg stream progress (1 FPS with scale 1280)
+- High-resolution video download progress
 - Gemini File API upload status
 - Polling for ACTIVE state
-- Final JSON timestamps (printed to logs)
+- Scene validation and filtering
+- Parallel clip processing and R2 uploads
+- Final scene data (printed to logs)
 
 Access logs via Modal dashboard or CLI:
 ```bash
@@ -268,7 +267,7 @@ modal logs clip-video
 ```bash
 curl -X POST https://kaiber-ai--clip-video-fastapi-app.modal.run/start \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://example.com/video.mp4"}'
+  -d '{"url": "https://example.com/video.mp4", "width": 1280, "height": 720}'
 ```
 
 ### Example: Check Status
