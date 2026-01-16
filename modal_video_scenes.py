@@ -264,7 +264,7 @@ async def process_video_with_gemini(url: str, width: int, height: int) -> List[D
                 response_schema=response_schema,
                 temperature=0.0, # Lower temperature = higher consistency
                 thinking_config=types.ThinkingConfig(thinking_level="high"),
-                max_output_tokens=8192, # Maximum possible to prevent truncation
+                max_output_tokens=65536, # Maximum possible to prevent truncation
                 safety_settings=[
                     types.SafetySetting(
                         category="HARM_CATEGORY_HARASSMENT",
