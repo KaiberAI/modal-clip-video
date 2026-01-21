@@ -21,7 +21,7 @@ app = modal.App("clip-video")
 # Image containing all required binaries and libraries
 image = (
     modal.Image.debian_slim(python_version="3.10")
-    .apt_install("ffmpeg", "git", "nodejs", "npm")
+    .apt_install("ffmpeg", "git", "nodejs", "npm", "libgl1-mesa-glx", "libglib2.0-0")
     .pip_install(
         "fastapi", 
         "google-genai", 
@@ -29,6 +29,7 @@ image = (
         "yt-dlp", 
         "boto3",
         "python-dotenv",
+        "scenedetect[opencv-headless]",
     )
     .run_commands("pip uninstall -y bson || true")
     .add_local_file("env_vars.py", "/root/env_vars.py", copy=True)
@@ -68,12 +69,58 @@ def cut_and_upload_clip(scene: Dict[str, Any], input_path: str) -> Dict[str, Any
     import subprocess
     import boto3
     import hashlib
+    import os
     from botocore.config import Config
+    
     from env_vars import config
+
     R2_ENDPOINT_URL = config.R2_ENDPOINT_URL
     R2_ACCESS_KEY_ID = config.R2_ACCESS_KEY_ID
     R2_SECRET_ACCESS_KEY = config.R2_SECRET_ACCESS_KEY
     R2_BUCKET_NAME = config.R2_BUCKET_NAME
+
+    def find_precise_boundary(fuzzy_time: float, video_path: str, is_end: bool = False) -> float:
+        from scenedetect import SceneManager, StatsManager, ContentDetector, open_video
+
+        try:
+            print(f"Finding precise boundary. Gemini time: {fuzzy_time} video path: {video_path}")
+            
+            video = open_video(video_path)
+            stats_manager = StatsManager()
+            scene_manager = SceneManager(stats_manager)
+            scene_manager.add_detector(ContentDetector(threshold=27.0))
+
+            # Search window: +/- 1 second
+            start_search = max(0, fuzzy_time - 1.0)
+            end_search = fuzzy_time + 1.0
+            
+            video.seek(start_search)
+            scene_manager.detect_scenes(video, end_time=end_search)
+            scene_list = scene_manager.get_scene_list()
+        
+            if not scene_list:
+                return fuzzy_time
+
+            # scene_list contains (start_time, end_time) tuples
+            # Cuts are the start times of scenes after the first one
+            cuts = [scene[0] for scene in scene_list[1:]]
+        
+            if not cuts:
+                return fuzzy_time
+
+            def get_score(timecode):
+                m = stats_manager.get_metrics(timecode.get_frames(), ['content_val'])
+                return m[0] if (m and m[0] is not None) else 0
+
+            best_cut_timecode = max(cuts, key=get_score)
+            actual_cut = best_cut_timecode.get_seconds()
+            print(f"Actual cut: {actual_cut}")
+
+            return actual_cut - 0.04 if is_end else actual_cut
+            
+        except Exception as e:
+            print(f"Precise detection failed for {fuzzy_time}: {e}")
+            return fuzzy_time  # Fallback to Gemini's original timestamp
 
     width = scene.get("width")
     height = scene.get("height")
@@ -81,22 +128,26 @@ def cut_and_upload_clip(scene: Dict[str, Any], input_path: str) -> Dict[str, Any
     # Generate unique hash for filename
     file_hash = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
     clip_filename = f"{file_hash}.mp4"
-    local_output_path = f"/videos/{clip_filename}"
+    local_output_path = f"/tmp/{clip_filename}"
     key = f"user-videos/temp/{clip_filename}"
+
+    start_time = find_precise_boundary(scene["start_time"], input_path, is_end=False)
+    end_time = find_precise_boundary(scene["end_time"], input_path, is_end=True)
     
-    # Fast Seek (-ss before -i) + Stream Copy (-c copy)
-    duration = scene["end_time"] - scene["start_time"]
+    duration = end_time - start_time
 
     cmd = [
         "ffmpeg", "-y",
+        "-ss", f"{start_time:.3f}",   # Seek before input
         "-i", input_path,
-        "-ss", str(scene["start_time"]),
-        "-to", str(scene["end_time"]),
+        "-t", f"{duration:.3f}",  # Use duration, not -to. 
         "-c:v", "libx264",        # Use H.264 video codec
         "-preset", "ultrafast",   # Keep it fast
         "-crf", "23",             # Good balance of quality/size
+        "-vsync", "cfr",          # Force constant frame rate logic
         "-c:a", "aac",            # Ensure audio is compatible
-        "-map_metadata", "0",
+        "-avoid_negative_ts", "make_zero", # Resets start timestamp to 0.0
+        "-map_metadata", "-1",             # Strips old sync data
         "-movflags", "+faststart",
         local_output_path
     ]
@@ -320,13 +371,11 @@ async def process_video_with_gemini(url: str, width: int, height: int) -> List[D
 
         # Filter/validate timestamps
         valid_timestamps = []
-        TRIM_START = 0.2
-        TRIM_END = 0.5
         MIN_RESULT_DURATION = 2.0
 
         for ts in timestamps:
-            start = float(ts.get("start_time", 0)) + TRIM_START
-            end = float(ts.get("end_time", 0)) - TRIM_END
+            start = float(ts.get("start_time", 0))
+            end = float(ts.get("end_time", 0))
             
             # Scene starts after the video actually ends (FAIL)
             if start >= actual_duration:
