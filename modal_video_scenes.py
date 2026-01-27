@@ -55,6 +55,72 @@ def get_video_duration(path: str) -> float:
         print(f"Error probing video duration: {e}")
         return 0.0
 
+def cut_and_upload_clip(start_time: float, end_time: float, input_path: str, scene_metadata: Dict[str, Any]) -> Dict[str, Any]:
+    import subprocess
+    import boto3
+    import hashlib
+    import os
+    import uuid
+    from botocore.config import Config
+    from env_vars import config
+
+    width = scene_metadata.get("width")
+    height = scene_metadata.get("height")
+    duration = end_time - start_time
+    file_hash = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
+    clip_filename = f"{file_hash}.mp4"
+    local_output_path = f"/tmp/{clip_filename}"
+    key = f"user-videos/temp/{clip_filename}"
+
+    # FFmpeg command
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", f"{start_time:.3f}",   # Seek before input
+        "-i", input_path,
+        "-t", f"{duration:.3f}",  # Use duration, not -to. 
+        "-c:v", "libx264",        # Use H.264 video codec
+        "-preset", "ultrafast",   # Keep it fast
+        "-crf", "23",             # Good balance of quality/size
+        "-vsync", "cfr",          # Force constant frame rate logic
+        "-c:a", "aac",            # Ensure audio is compatible
+        "-avoid_negative_ts", "make_zero", # Resets start timestamp to 0.0
+        "-map_metadata", "-1",             # Strips old sync data
+        "-movflags", "+faststart",
+        local_output_path
+    ]
+    subprocess.run(cmd, check=True)
+
+    # Upload to R2 bucket
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=config.R2_ENDPOINT_URL,
+        aws_access_key_id=config.R2_ACCESS_KEY_ID,
+        aws_secret_access_key=config.R2_SECRET_ACCESS_KEY,
+        config=Config(signature_version="s3v4"),
+        region_name="auto" 
+    )
+    s3.upload_file(local_output_path, config.R2_BUCKET_NAME, key)
+
+    # Generate presigned URL (valid for 24 hours) - CURRENTLY UNUSED
+    presigned_url = s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": config.R2_BUCKET_NAME, "Key": key},
+        ExpiresIn=86400 
+    )
+
+    if os.path.exists(local_output_path):
+        os.remove(local_output_path)
+
+    return {
+        **scene_metadata,
+        "url": presigned_url,
+        "filename": clip_filename,
+        "key": key,
+        "width": width,
+        "height": height,
+        "length": round(duration, 2),
+    }
+
 # FAN-OUT WORKER: Cut and Upload to R2
 @app.function(
     image=image, 
@@ -64,20 +130,10 @@ def get_video_duration(path: str) -> float:
     retries=2,
     timeout=300
 )
-def cut_and_upload_clip(scene: Dict[str, Any], input_path: str) -> Dict[str, Any]:
+def create_clip(scene: Dict[str, Any], input_path: str) -> Dict[str, Any]:
     """Runs in parallel for every scene: Clips via FFmpeg and uploads to R2."""
     import subprocess
-    import boto3
-    import hashlib
     import os
-    from botocore.config import Config
-    
-    from env_vars import config
-
-    R2_ENDPOINT_URL = config.R2_ENDPOINT_URL
-    R2_ACCESS_KEY_ID = config.R2_ACCESS_KEY_ID
-    R2_SECRET_ACCESS_KEY = config.R2_SECRET_ACCESS_KEY
-    R2_BUCKET_NAME = config.R2_BUCKET_NAME
 
     def find_precise_boundary(fuzzy_time: float, video_path: str, is_end: bool = False) -> float:
         from scenedetect import SceneManager, StatsManager, ContentDetector, open_video
@@ -122,71 +178,15 @@ def cut_and_upload_clip(scene: Dict[str, Any], input_path: str) -> Dict[str, Any
             print(f"Precise detection failed for {fuzzy_time}: {e}")
             return fuzzy_time  # Fallback to Gemini's original timestamp
 
-    width = scene.get("width")
-    height = scene.get("height")
-
-    # Generate unique hash for filename
-    file_hash = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
-    clip_filename = f"{file_hash}.mp4"
-    local_output_path = f"/tmp/{clip_filename}"
-    key = f"user-videos/temp/{clip_filename}"
-
     start_time = find_precise_boundary(scene["start_time"], input_path, is_end=False)
     end_time = find_precise_boundary(scene["end_time"], input_path, is_end=True)
     
-    duration = end_time - start_time
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", f"{start_time:.3f}",   # Seek before input
-        "-i", input_path,
-        "-t", f"{duration:.3f}",  # Use duration, not -to. 
-        "-c:v", "libx264",        # Use H.264 video codec
-        "-preset", "ultrafast",   # Keep it fast
-        "-crf", "23",             # Good balance of quality/size
-        "-vsync", "cfr",          # Force constant frame rate logic
-        "-c:a", "aac",            # Ensure audio is compatible
-        "-avoid_negative_ts", "make_zero", # Resets start timestamp to 0.0
-        "-map_metadata", "-1",             # Strips old sync data
-        "-movflags", "+faststart",
-        local_output_path
-    ]
-    
-    subprocess.run(cmd, check=True)
-
-    # Initialize R2 Client (S3 Compatible)
-    s3 = boto3.client(
-        "s3",
-        endpoint_url=R2_ENDPOINT_URL,
-        aws_access_key_id=R2_ACCESS_KEY_ID,
-        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-        config=Config(signature_version="s3v4"),
-        region_name="auto" 
+    final_clips = []
+    final_clips.append(
+        cut_and_upload_clip(start_time, end_time, input_path, scene)
     )
 
-    # Upload to R2
-    s3.upload_file(local_output_path, R2_BUCKET_NAME, key)
-
-    # Generate Presigned URL (Valid for 24 hours) - UNUSED
-    presigned_url = s3.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": R2_BUCKET_NAME, "Key": key},
-        ExpiresIn=86400 
-    )
-
-    # Cleanup Volume storage
-    if os.path.exists(local_output_path):
-        os.remove(local_output_path)
-
-    return {
-        **scene,
-        "url": presigned_url,
-        "filename": clip_filename,
-        "key": key,
-        "width": width,
-        "height": height,
-        "length": round(duration, 2),
-    }
+    return final_clips
 
 # TRACK B HELPER: High-Res Download
 async def download_high_res_video(url: str, output_path: str):
@@ -412,7 +412,7 @@ async def process_video_with_gemini(url: str, width: int, height: int) -> List[D
         final_clips = []
         completed_count = 0
 
-        async for clip in cut_and_upload_clip.map.aio(
+        async for clip in create_clip.map.aio(
             valid_timestamps, 
             kwargs={"input_path": high_res_path},
             return_exceptions=True,            # Don't crash the whole job
@@ -428,7 +428,7 @@ async def process_video_with_gemini(url: str, width: int, height: int) -> List[D
             current_val = round(0.5 + (percent_of_fanout * 0.5), 2)
             progress_tracker[job_id] = current_val
 
-            final_clips.append(clip)
+            final_clips.extend(clip)
         
         # Cleanup original high-res video from Volume
         if os.path.exists(high_res_path):
