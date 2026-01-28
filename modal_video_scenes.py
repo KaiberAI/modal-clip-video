@@ -109,7 +109,7 @@ def find_precise_boundary(fuzzy_time: float, video_path: str) -> float:
             proximity_multiplier = max(0, 1.0 - (distance / SEARCH_RADIUS))
             
             # Combine scores. We square the proximity to bias heavily toward the fuzzy_time.
-            return cut_strength * (proximity_multiplier ** 2)
+            return cut_strength * proximity_multiplier
 
         best_cut_timecode = max(cuts, key=get_fitness_score)
         actual_cut = best_cut_timecode.get_seconds()
