@@ -81,9 +81,10 @@ def find_precise_boundary(fuzzy_time: float, video_path: str, is_end: bool = Fal
         scene_manager = SceneManager(stats_manager)
         scene_manager.add_detector(ContentDetector(threshold=27.0))
 
-        # Search window: +/- 1 second
-        start_search = max(0, fuzzy_time - 1.0)
-        end_search = fuzzy_time + 1.0
+        # Search window: +/- 1.5 second
+        SEARCH_RADIUS = 1.5
+        start_search = max(0, fuzzy_time - SEARCH_RADIUS)
+        end_search = fuzzy_time + SEARCH_RADIUS
         
         video.seek(start_search)
         scene_manager.detect_scenes(video, end_time=end_search)
@@ -99,15 +100,22 @@ def find_precise_boundary(fuzzy_time: float, video_path: str, is_end: bool = Fal
         if not cuts:
             return fuzzy_time
 
-        def get_score(timecode):
+        def get_fitness_score(timecode):
             m = stats_manager.get_metrics(timecode.get_frames(), ['content_val'])
-            return m[0] if (m and m[0] is not None) else 0
+            cut_strength = m[0] if (m and m[0] is not None) else 0
+            
+            # Higher distance = lower multiplier
+            distance = abs(timecode.get_seconds() - fuzzy_time)
+            proximity_multiplier = max(0, 1.0 - (distance / SEARCH_RADIUS))
+            
+            # Combine scores. We square the proximity to bias heavily toward the fuzzy_time.
+            return cut_strength * (proximity_multiplier ** 2)
 
-        best_cut_timecode = max(cuts, key=get_score)
+        best_cut_timecode = max(cuts, key=get_fitness_score)
         actual_cut = best_cut_timecode.get_seconds()
         print(f"Actual cut: {actual_cut}")
 
-        return actual_cut - 0.04 if is_end else actual_cut
+        return actual_cut - 0.06 if is_end else actual_cut
         
     except Exception as e:
         print(f"Precise detection failed for {fuzzy_time}: {e}")
@@ -130,11 +138,8 @@ def detect_high_confidence_subscenes(start_time: float, end_time: float, video_p
         scene_manager.detect_scenes(video, end_time=end_time)
 
         raw_scenes = scene_manager.get_scene_list()
-        # print(f"raw_scenes: {raw_scenes}")
         if len(raw_scenes) <= 1:
             return []
-
-        # print(stats_manager._frame_metrics)
 
         final_scenes = []
         current_scene_start = raw_scenes[0][0]
@@ -198,7 +203,7 @@ def cut_and_upload_clip(start_time: float, end_time: float, input_path: str, sce
         "ffmpeg", "-y",
         "-ss", f"{start_time:.3f}",         # Seek before input
         "-i", input_path,
-        "-t", f"{duration:.3f}",            # Use duration, not -to. 
+        "-to", f"{duration:.3f}",           # Use duration 
         "-c:v", "libx264",                  # Use H.264 video codec
         "-preset", "ultrafast",             # Keep it fast
         "-crf", "23",                       # Good balance of quality/size
