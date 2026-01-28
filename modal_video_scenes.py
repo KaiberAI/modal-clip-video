@@ -274,7 +274,7 @@ def create_clip(scene: Dict[str, Any], input_path: str) -> Dict[str, Any]:
         for sub in sub_scenes:
             abs_start = sub[0].get_seconds()
             abs_end = sub[1].get_seconds()
-            if abs_end - abs_start >= 1.0:
+            if abs_end - abs_start >= 0.8:
                 final_clips.append(cut_and_upload_clip(abs_start, abs_end, input_path, scene))
 
     return final_clips
