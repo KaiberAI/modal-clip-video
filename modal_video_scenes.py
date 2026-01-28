@@ -72,7 +72,7 @@ def get_video_duration(path: str) -> float:
         print(f"Error probing video duration: {e}")
         return 0.0
 
-def find_precise_boundary(fuzzy_time: float, video_path: str, is_end: bool = False) -> float:
+def find_precise_boundary(fuzzy_time: float, video_path: str) -> float:
     try:
         print(f"Finding precise boundary. Gemini time: {fuzzy_time} video path: {video_path}")
         
@@ -114,8 +114,7 @@ def find_precise_boundary(fuzzy_time: float, video_path: str, is_end: bool = Fal
         best_cut_timecode = max(cuts, key=get_fitness_score)
         actual_cut = best_cut_timecode.get_seconds()
         print(f"Actual cut: {actual_cut}")
-
-        return actual_cut - 0.06 if is_end else actual_cut
+        return actual_cut
         
     except Exception as e:
         print(f"Precise detection failed for {fuzzy_time}: {e}")
@@ -192,7 +191,7 @@ def cut_and_upload_clip(start_time: float, end_time: float, input_path: str, sce
 
     width = scene_metadata.get("width")
     height = scene_metadata.get("height")
-    duration = end_time - start_time
+    duration = (end_time - start_time) - 0.06 # 0.06 to prevent frame bleed
     file_hash = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
     clip_filename = f"{file_hash}.mp4"
     local_output_path = f"/tmp/{clip_filename}"
@@ -259,8 +258,8 @@ def cut_and_upload_clip(start_time: float, end_time: float, input_path: str, sce
 def create_clip(scene: Dict[str, Any], input_path: str) -> Dict[str, Any]:
     """Runs in parallel for every scene: Clips via FFmpeg and uploads to R2."""
 
-    start_time = find_precise_boundary(scene["start_time"], input_path, is_end=False)
-    end_time = find_precise_boundary(scene["end_time"], input_path, is_end=True)
+    start_time = find_precise_boundary(scene["start_time"], input_path)
+    end_time = find_precise_boundary(scene["end_time"], input_path)
 
     # Perform sub-scene analysis
     sub_scenes = detect_high_confidence_subscenes(start_time, end_time, input_path)
