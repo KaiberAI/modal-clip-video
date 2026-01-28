@@ -5,10 +5,20 @@ import io
 import time
 import uuid
 import asyncio
-from datetime import datetime
 from typing import Dict, Any, List
 
 import modal
+
+try:
+    import boto3
+    import hashlib
+    import yt_dlp
+    import numpy as np
+    from scenedetect import SceneManager, StatsManager, ContentDetector, AdaptiveDetector, HashDetector, open_video, FrameTimecode
+    from google import genai
+    from google.genai import types
+except ImportError:
+    pass
 
 # Volume for shared high-res videos between coordinator and parallel workers
 video_storage = modal.Volume.from_name("high-res-videos", create_if_missing=True)
@@ -21,7 +31,14 @@ app = modal.App("clip-video")
 # Image containing all required binaries and libraries
 image = (
     modal.Image.debian_slim(python_version="3.10")
-    .apt_install("ffmpeg", "git", "nodejs", "npm", "libgl1-mesa-glx", "libglib2.0-0")
+    .apt_install(
+        "ffmpeg", 
+        "git", 
+        "nodejs", 
+        "npm", 
+        "libgl1-mesa-glx", 
+        "libglib2.0-0", 
+    )
     .pip_install(
         "fastapi", 
         "google-genai", 
@@ -30,6 +47,7 @@ image = (
         "boto3",
         "python-dotenv",
         "scenedetect[opencv-headless]",
+        "numpy"
     )
     .run_commands("pip uninstall -y bson || true")
     .add_local_file("env_vars.py", "/root/env_vars.py", copy=True)
@@ -43,7 +61,6 @@ image = image.run_commands(
 )
 
 def get_video_duration(path: str) -> float:
-    import subprocess
     try:
         cmd = [
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -55,12 +72,116 @@ def get_video_duration(path: str) -> float:
         print(f"Error probing video duration: {e}")
         return 0.0
 
+def find_precise_boundary(fuzzy_time: float, video_path: str, is_end: bool = False) -> float:
+    try:
+        print(f"Finding precise boundary. Gemini time: {fuzzy_time} video path: {video_path}")
+        
+        video = open_video(video_path)
+        stats_manager = StatsManager()
+        scene_manager = SceneManager(stats_manager)
+        scene_manager.add_detector(ContentDetector(threshold=27.0))
+
+        # Search window: +/- 1 second
+        start_search = max(0, fuzzy_time - 1.0)
+        end_search = fuzzy_time + 1.0
+        
+        video.seek(start_search)
+        scene_manager.detect_scenes(video, end_time=end_search)
+        scene_list = scene_manager.get_scene_list()
+    
+        if not scene_list:
+            return fuzzy_time
+
+        # scene_list contains (start_time, end_time) tuples
+        # Cuts are the start times of scenes after the first one
+        cuts = [scene[0] for scene in scene_list[1:]]
+    
+        if not cuts:
+            return fuzzy_time
+
+        def get_score(timecode):
+            m = stats_manager.get_metrics(timecode.get_frames(), ['content_val'])
+            return m[0] if (m and m[0] is not None) else 0
+
+        best_cut_timecode = max(cuts, key=get_score)
+        actual_cut = best_cut_timecode.get_seconds()
+        print(f"Actual cut: {actual_cut}")
+
+        return actual_cut - 0.04 if is_end else actual_cut
+        
+    except Exception as e:
+        print(f"Precise detection failed for {fuzzy_time}: {e}")
+        return fuzzy_time  # Fallback to Gemini's original timestamp
+
+def detect_high_confidence_subscenes(start_time: float, end_time: float, video_path: str) -> List[tuple]:
+    ADAPTIVE_THRESHOLD = 7.0
+    SCREAMER_ADAPTIVE_THRESHOLD = 13.0
+    HASH_THRESHOLD = 0.4
+    
+    try:
+        video = open_video(video_path)
+        fps = video.frame_rate
+        video.seek(start_time)
+
+        stats_manager = StatsManager()
+        scene_manager = SceneManager(stats_manager)
+        scene_manager.add_detector(AdaptiveDetector(adaptive_threshold=ADAPTIVE_THRESHOLD))
+        scene_manager.add_detector(HashDetector(threshold=HASH_THRESHOLD))
+        scene_manager.detect_scenes(video, end_time=end_time)
+
+        raw_scenes = scene_manager.get_scene_list()
+        # print(f"raw_scenes: {raw_scenes}")
+        if len(raw_scenes) <= 1:
+            return []
+
+        # print(stats_manager._frame_metrics)
+
+        final_scenes = []
+        current_scene_start = raw_scenes[0][0]
+
+        for i in range(len(raw_scenes) - 1):
+            cut_timecode = raw_scenes[i][1] # The 'cut' is the end of the current raw scene
+            cut_frame = cut_timecode.get_frames()
+
+            # --- CONSENSUS CHECK ---
+            adaptive_metric = 'adaptive_ratio (w=2)'
+            hash_metric = 'hash_dist [size=16 lowpass=2]'
+
+            if stats_manager.metrics_exist(cut_frame, [adaptive_metric, hash_metric]):
+                metrics = stats_manager.get_metrics(cut_frame, [adaptive_metric, hash_metric])
+                
+                adaptive_val = metrics[0] if metrics[0] is not None else 0
+                hash_val = metrics[1] if metrics[1] is not None else 0
+
+                # DUAL CONSENSUS: Both must cross the threshold
+                # OR one must be an extreme 'screamer'
+                is_consensus = (adaptive_val >= ADAPTIVE_THRESHOLD and hash_val >= HASH_THRESHOLD)
+                is_screamer = (adaptive_val >= SCREAMER_ADAPTIVE_THRESHOLD)
+
+                if is_consensus or is_screamer:
+                    label = "CONSENSUS" if is_consensus else "SCREAMER"
+                    print(f"CUT ACCEPTED [{label}] at frame {cut_frame}: A={adaptive_val:.2f}, H={hash_val:.2f}")
+                    final_scenes.append((current_scene_start, cut_timecode))
+                    current_scene_start = cut_timecode
+                else:
+                    print(f"CUT REJECTED at frame {cut_frame}: A={adaptive_val:.2f}, H={hash_val:.2f} (Weak Signal)")
+            else:
+                print(f"CUT REJECTED at frame {cut_frame}: NO METRICS FOUND in StatsManager")
+
+        if not final_scenes:
+            return []
+
+        # Add the final segment (from the last valid cut to the end of the search window)
+        final_end_time = FrameTimecode(end_time, fps=fps)
+        final_scenes.append((current_scene_start, final_end_time))
+
+        return final_scenes
+
+    except Exception as e:
+        print(f"High confidence subscenes detection failed for: {e}")
+        return []
+
 def cut_and_upload_clip(start_time: float, end_time: float, input_path: str, scene_metadata: Dict[str, Any]) -> Dict[str, Any]:
-    import subprocess
-    import boto3
-    import hashlib
-    import os
-    import uuid
     from botocore.config import Config
     from env_vars import config
 
@@ -75,16 +196,16 @@ def cut_and_upload_clip(start_time: float, end_time: float, input_path: str, sce
     # FFmpeg command
     cmd = [
         "ffmpeg", "-y",
-        "-ss", f"{start_time:.3f}",   # Seek before input
+        "-ss", f"{start_time:.3f}",         # Seek before input
         "-i", input_path,
-        "-t", f"{duration:.3f}",  # Use duration, not -to. 
-        "-c:v", "libx264",        # Use H.264 video codec
-        "-preset", "ultrafast",   # Keep it fast
-        "-crf", "23",             # Good balance of quality/size
-        "-vsync", "cfr",          # Force constant frame rate logic
-        "-c:a", "aac",            # Ensure audio is compatible
-        "-avoid_negative_ts", "make_zero", # Resets start timestamp to 0.0
-        "-map_metadata", "-1",             # Strips old sync data
+        "-t", f"{duration:.3f}",            # Use duration, not -to. 
+        "-c:v", "libx264",                  # Use H.264 video codec
+        "-preset", "ultrafast",             # Keep it fast
+        "-crf", "23",                       # Good balance of quality/size
+        "-fps_mode", "cfr",                 # Force constant frame rate logic
+        "-c:a", "aac",                      # Ensure audio is compatible
+        "-avoid_negative_ts", "make_zero",  # Resets start timestamp to 0.0
+        "-map_metadata", "-1",              # Strips old sync data
         "-movflags", "+faststart",
         local_output_path
     ]
@@ -132,69 +253,37 @@ def cut_and_upload_clip(start_time: float, end_time: float, input_path: str, sce
 )
 def create_clip(scene: Dict[str, Any], input_path: str) -> Dict[str, Any]:
     """Runs in parallel for every scene: Clips via FFmpeg and uploads to R2."""
-    import subprocess
-    import os
-
-    def find_precise_boundary(fuzzy_time: float, video_path: str, is_end: bool = False) -> float:
-        from scenedetect import SceneManager, StatsManager, ContentDetector, open_video
-
-        try:
-            print(f"Finding precise boundary. Gemini time: {fuzzy_time} video path: {video_path}")
-            
-            video = open_video(video_path)
-            stats_manager = StatsManager()
-            scene_manager = SceneManager(stats_manager)
-            scene_manager.add_detector(ContentDetector(threshold=27.0))
-
-            # Search window: +/- 1 second
-            start_search = max(0, fuzzy_time - 1.0)
-            end_search = fuzzy_time + 1.0
-            
-            video.seek(start_search)
-            scene_manager.detect_scenes(video, end_time=end_search)
-            scene_list = scene_manager.get_scene_list()
-        
-            if not scene_list:
-                return fuzzy_time
-
-            # scene_list contains (start_time, end_time) tuples
-            # Cuts are the start times of scenes after the first one
-            cuts = [scene[0] for scene in scene_list[1:]]
-        
-            if not cuts:
-                return fuzzy_time
-
-            def get_score(timecode):
-                m = stats_manager.get_metrics(timecode.get_frames(), ['content_val'])
-                return m[0] if (m and m[0] is not None) else 0
-
-            best_cut_timecode = max(cuts, key=get_score)
-            actual_cut = best_cut_timecode.get_seconds()
-            print(f"Actual cut: {actual_cut}")
-
-            return actual_cut - 0.04 if is_end else actual_cut
-            
-        except Exception as e:
-            print(f"Precise detection failed for {fuzzy_time}: {e}")
-            return fuzzy_time  # Fallback to Gemini's original timestamp
 
     start_time = find_precise_boundary(scene["start_time"], input_path, is_end=False)
     end_time = find_precise_boundary(scene["end_time"], input_path, is_end=True)
-    
+
+    # Perform sub-scene analysis
+    sub_scenes = detect_high_confidence_subscenes(start_time, end_time, input_path)
     final_clips = []
-    final_clips.append(
-        cut_and_upload_clip(start_time, end_time, input_path, scene)
-    )
+
+    if not sub_scenes:
+        print("No obvious cuts. Process as one single clip.")
+        final_clips.append(cut_and_upload_clip(start_time, end_time, input_path, scene))
+    else:
+        print("Potentially obvious cuts missed by Gemini. Process sub-clips.")
+        for sub in sub_scenes:
+            abs_start = sub[0].get_seconds()
+            abs_end = sub[1].get_seconds()
+            if abs_end - abs_start >= 0.8:
+                final_clips.append(cut_and_upload_clip(abs_start, abs_end, input_path, scene))
 
     return final_clips
 
 # TRACK B HELPER: High-Res Download
 async def download_high_res_video(url: str, output_path: str):
-    import yt_dlp
     ydl_opts = {
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': output_path,
         'quiet': True,
+        'socket_timeout': 30,
+        'retries': 5,
+        'fragment_retries': 10,
+        'retry_sleep': lambda n: 2 * n,
     }
     def download():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -214,8 +303,6 @@ async def process_video_with_gemini(url: str, width: int, height: int) -> List[D
     job_id = modal.current_function_call_id()
     progress_tracker[job_id] = 0.1
     
-    from google import genai
-    from google.genai import types
     from env_vars import config
 
     client = genai.Client(api_key=config.GOOGLE_GEMINI_API_KEY)
@@ -223,8 +310,6 @@ async def process_video_with_gemini(url: str, width: int, height: int) -> List[D
     high_res_path = f"/videos/{video_id}.mp4"
 
     async def perform_gemini_analysis():
-        from google.genai import types
-
         progress_tracker[job_id] = 0.2
         
         # FFmpeg 1 FPS Stream logic
@@ -455,8 +540,6 @@ def fastapi_app():
     from fastapi import FastAPI
     from pydantic import BaseModel
     import modal.functions
-    import json
-    import asyncio
     
     web_app = FastAPI(title="Beat Sync Video Clipping Worker")
 
