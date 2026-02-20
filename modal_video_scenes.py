@@ -195,7 +195,7 @@ def cut_and_upload_clip(start_time: float, end_time: float, input_path: str, sce
     file_hash = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
     clip_filename = f"{file_hash}.mp4"
     local_output_path = f"/tmp/{clip_filename}"
-    key = f"user-videos/temp/{clip_filename}"
+    key = f"user-videos/{clip_filename}"
 
     # FFmpeg command
     cmd = [
