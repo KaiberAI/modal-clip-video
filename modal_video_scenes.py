@@ -28,6 +28,8 @@ progress_tracker = modal.Dict.from_name("clipping-progress", create_if_missing=T
 
 app = modal.App("clip-video")
 
+MIN_RESULT_DURATION = 2.0
+
 # Image containing all required binaries and libraries
 image = (
     modal.Image.debian_slim(python_version="3.10")
@@ -185,6 +187,19 @@ def detect_high_confidence_subscenes(start_time: float, end_time: float, video_p
         print(f"High confidence subscenes detection failed for: {e}")
         return []
 
+def split_time_range(start: float, end: float, max_duration: float) -> List[tuple]:
+    segments = []
+    current = start
+    while current < end:
+        seg_end = min(current + max_duration, end)
+        # If the remainder after this cut would be shorter than MIN_RESULT_DURATION,
+        # absorb it into the current segment rather than creating a tiny tail clip.
+        if end - seg_end < MIN_RESULT_DURATION:
+            seg_end = end
+        segments.append((current, seg_end))
+        current = seg_end
+    return segments
+
 def cut_and_upload_clip(start_time: float, end_time: float, input_path: str, scene_metadata: Dict[str, Any]) -> Dict[str, Any]:
     from botocore.config import Config
     from env_vars import config
@@ -255,7 +270,7 @@ def cut_and_upload_clip(start_time: float, end_time: float, input_path: str, sce
     retries=2,
     timeout=300
 )
-def create_clip(scene: Dict[str, Any], input_path: str) -> Dict[str, Any]:
+def create_clip(scene: Dict[str, Any], input_path: str, max_clip_duration: float=None) -> Dict[str, Any]:
     """Runs in parallel for every scene: Clips via FFmpeg and uploads to R2."""
 
     start_time = find_precise_boundary(scene["start_time"], input_path)
@@ -265,16 +280,23 @@ def create_clip(scene: Dict[str, Any], input_path: str) -> Dict[str, Any]:
     sub_scenes = detect_high_confidence_subscenes(start_time, end_time, input_path)
     final_clips = []
 
+    def get_segments(seg_start: float, seg_end: float) -> List[tuple]:
+        if max_clip_duration is None:
+            return [(seg_start, seg_end)]
+        return split_time_range(seg_start, seg_end, max_clip_duration)
+
     if not sub_scenes:
         print("No obvious cuts. Process as one single clip.")
-        final_clips.append(cut_and_upload_clip(start_time, end_time, input_path, scene))
+        for s, e in get_segments(start_time, end_time):
+            final_clips.append(cut_and_upload_clip(s, e, input_path, scene))
     else:
         print("Potentially obvious cuts missed by Gemini. Process sub-clips.")
         for sub in sub_scenes:
             abs_start = sub[0].get_seconds()
             abs_end = sub[1].get_seconds()
             if abs_end - abs_start >= 0.8:
-                final_clips.append(cut_and_upload_clip(abs_start, abs_end, input_path, scene))
+                for s, e in get_segments(abs_start, abs_end):
+                    final_clips.append(cut_and_upload_clip(s, e, input_path, scene))
 
     return final_clips
 
@@ -460,7 +482,6 @@ async def process_video_with_gemini(url: str, width: int, height: int) -> List[D
 
         # Filter/validate timestamps
         valid_timestamps = []
-        MIN_RESULT_DURATION = 2.0
 
         for ts in timestamps:
             start = float(ts.get("start_time", 0))
@@ -503,7 +524,7 @@ async def process_video_with_gemini(url: str, width: int, height: int) -> List[D
 
         async for clip in create_clip.map.aio(
             valid_timestamps, 
-            kwargs={"input_path": high_res_path},
+            kwargs={"input_path": high_res_path, "max_clip_duration": 15},
             return_exceptions=True,            # Don't crash the whole job
             wrap_returned_exceptions=False     # Return the raw error
         ):
