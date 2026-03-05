@@ -28,7 +28,7 @@ progress_tracker = modal.Dict.from_name("clipping-progress", create_if_missing=T
 
 app = modal.App("clip-video")
 
-MIN_RESULT_DURATION = 2.0
+MIN_RESULT_DURATION = 1.0
 
 # Image containing all required binaries and libraries
 image = (
@@ -276,6 +276,10 @@ def create_clip(scene: Dict[str, Any], input_path: str, max_clip_duration: float
     start_time = find_precise_boundary(scene["start_time"], input_path)
     end_time = find_precise_boundary(scene["end_time"], input_path)
 
+    if (end_time - start_time) < MIN_RESULT_DURATION:
+        print(f"Skipping clip: precise duration {end_time - start_time:.2f}s is below MIN_RESULT_DURATION ({MIN_RESULT_DURATION}s).")
+        return []
+
     # Perform sub-scene analysis
     sub_scenes = detect_high_confidence_subscenes(start_time, end_time, input_path)
     final_clips = []
@@ -498,7 +502,7 @@ async def process_video_with_gemini(url: str, width: int, height: int) -> List[D
 
             duration = end - start
             
-            # Filter clips shorter than 2 seconds
+            # Filter clips that are too short
             if duration >= MIN_RESULT_DURATION:
                 ts.update({
                     "start_time": start,
